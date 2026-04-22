@@ -3,7 +3,7 @@ mod models;
 
 use std::{
     collections::HashMap,
-    fs,
+    env, fs,
     net::SocketAddr,
     path::{Path as FsPath, PathBuf},
     process::Command,
@@ -22,9 +22,12 @@ use axum::{
 use chrono::Utc;
 use llm::{GeneratedChunkContent, SharedLlmClient, build_llm_client};
 use models::{
-    BookChunk, ChunkListItem, CreatedDocumentResponse, Document, GenerateChunkResponse,
-    GenerateDocumentResponse, QaRequest, QaResponse,
+    BookChunk, ChunkListItem, CreatedDocumentResponse, Document, GenerateAudioResponse,
+    GenerateChunkResponse, GenerateDocumentResponse, QaRequest, QaResponse,
 };
+use reqwest::Client;
+use serde::Deserialize;
+use tower_http::services::ServeDir;
 use tower_http::{cors::CorsLayer, trace::TraceLayer};
 use tracing::info;
 use uuid::Uuid;
@@ -34,6 +37,8 @@ struct AppState {
     store: Arc<RwLock<Store>>,
     data_dir: PathBuf,
     llm_client: SharedLlmClient,
+    http_client: Client,
+    voicevox_base_url: String,
 }
 
 #[derive(Default)]
@@ -53,6 +58,9 @@ async fn main() {
         store: Arc::new(RwLock::new(load_store(&data_dir))),
         data_dir,
         llm_client: build_llm_client(),
+        http_client: Client::new(),
+        voicevox_base_url: env::var("VOICEVOX_BASE_URL")
+            .unwrap_or_else(|_| "http://127.0.0.1:50021".to_string()),
     };
 
     let app = Router::new()
@@ -62,7 +70,9 @@ async fn main() {
         .route("/api/documents/{id}/chunks", get(list_document_chunks))
         .route("/api/chunks/{id}", get(get_chunk))
         .route("/api/chunks/{id}/generate", post(generate_chunk))
+        .route("/api/chunks/{id}/audio", post(generate_audio))
         .route("/api/chunks/{id}/qa", post(answer_chunk_question))
+        .nest_service("/audio", ServeDir::new(state.data_dir.join("audio")))
         .layer(DefaultBodyLimit::max(32 * 1024 * 1024))
         .with_state(state)
         .layer(CorsLayer::permissive())
@@ -301,6 +311,23 @@ async fn generate_document(
     }))
 }
 
+async fn generate_audio(
+    Path(id): Path<String>,
+    State(state): State<AppState>,
+) -> Result<Json<GenerateAudioResponse>, AppError> {
+    let chunk = read_chunk(&state, &id)?;
+    let updated_chunk = synthesize_chunk_audio(&state, chunk).await?;
+    let audio_url = updated_chunk
+        .audio_path
+        .clone()
+        .ok_or_else(|| AppError::internal("audio path was not set after synthesis"))?;
+
+    Ok(Json(GenerateAudioResponse {
+        chunk: updated_chunk,
+        audio_url,
+    }))
+}
+
 fn read_chunk(state: &AppState, id: &str) -> Result<BookChunk, AppError> {
     let store = state
         .store
@@ -443,6 +470,107 @@ fn fallback_generated_content(chunk: &BookChunk) -> GeneratedChunkContent {
         ),
         qa_context: chunk.source_text.clone(),
     }
+}
+
+async fn synthesize_chunk_audio(state: &AppState, chunk: BookChunk) -> Result<BookChunk, AppError> {
+    let script = if chunk.dialogue_script.trim().is_empty() {
+        return Err(AppError::bad_request("dialogue_script is empty"));
+    } else {
+        chunk.dialogue_script.clone()
+    };
+
+    let audio_bytes =
+        synthesize_with_voicevox(&state.http_client, &state.voicevox_base_url, &script, 3).await?;
+
+    let file_name = format!("{}.wav", chunk.id);
+    let audio_path = state.data_dir.join("audio").join(&file_name);
+    tokio::fs::write(&audio_path, audio_bytes)
+        .await
+        .map_err(|_| AppError::internal("failed to write synthesized audio"))?;
+
+    let updated_chunk = BookChunk {
+        audio_path: Some(format!("/audio/{file_name}")),
+        ..chunk
+    };
+
+    {
+        let mut store = state
+            .store
+            .write()
+            .map_err(|_| AppError::internal("failed to update chunk store"))?;
+        store
+            .chunks
+            .insert(updated_chunk.id.clone(), updated_chunk.clone());
+    }
+
+    persist_chunk(&state.data_dir, &updated_chunk)?;
+
+    Ok(updated_chunk)
+}
+
+async fn synthesize_with_voicevox(
+    http_client: &Client,
+    base_url: &str,
+    text: &str,
+    speaker: u32,
+) -> Result<Vec<u8>, AppError> {
+    let query_url = format!("{}/audio_query", base_url.trim_end_matches('/'));
+    let synthesis_url = format!("{}/synthesis", base_url.trim_end_matches('/'));
+
+    let query = http_client
+        .post(&query_url)
+        .query(&[("text", text), ("speaker", &speaker.to_string())])
+        .send()
+        .await
+        .map_err(|_| AppError::internal("failed to call VOICEVOX audio_query"))?;
+
+    if !query.status().is_success() {
+        return Err(AppError::internal(format!(
+            "VOICEVOX audio_query failed with status {}",
+            query.status()
+        )));
+    }
+
+    let voice_query = query
+        .json::<VoicevoxAudioQuery>()
+        .await
+        .map_err(|_| AppError::internal("failed to parse VOICEVOX audio_query response"))?;
+
+    let synthesis = http_client
+        .post(&synthesis_url)
+        .query(&[("speaker", &speaker.to_string())])
+        .json(&voice_query)
+        .send()
+        .await
+        .map_err(|_| AppError::internal("failed to call VOICEVOX synthesis"))?;
+
+    if !synthesis.status().is_success() {
+        return Err(AppError::internal(format!(
+            "VOICEVOX synthesis failed with status {}",
+            synthesis.status()
+        )));
+    }
+
+    synthesis
+        .bytes()
+        .await
+        .map(|bytes| bytes.to_vec())
+        .map_err(|_| AppError::internal("failed to read VOICEVOX synthesized audio"))
+}
+
+#[derive(Debug, Clone, Deserialize, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct VoicevoxAudioQuery {
+    accent_phrases: serde_json::Value,
+    speed_scale: f64,
+    pitch_scale: f64,
+    intonation_scale: f64,
+    volume_scale: f64,
+    pre_phoneme_length: f64,
+    post_phoneme_length: f64,
+    output_sampling_rate: u32,
+    output_stereo: bool,
+    kana: Option<String>,
 }
 
 async fn extract_page_count(pdf_path: &FsPath) -> Result<u32, AppError> {

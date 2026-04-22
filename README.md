@@ -116,6 +116,12 @@ pub struct BookChunk {
 
 - chunk 1 件だけ Claude で生成し直す
 
+### `POST /api/chunks/:id/audio`
+
+- `dialogue_script` を VOICEVOX で wav 化
+- `data/audio/<chunk_id>.wav` に保存
+- `chunk.audio_path` を `/audio/<chunk_id>.wav` に更新
+
 ### `POST /api/chunks/:id/qa`
 
 - 入力
@@ -130,8 +136,9 @@ pub struct BookChunk {
 2. `backend/` の axum API を起動する
 3. `POST /api/documents` で PDF をアップロードする
 4. `POST /api/chunks/:id/generate` か `POST /api/documents/:id/generate` を呼ぶ
-5. `POST /api/chunks/:id/qa` でその範囲に質問する
-6. VOICEVOX 連携と Vue フロントエンドを追加する
+5. `POST /api/chunks/:id/audio` で音声を生成する
+6. `POST /api/chunks/:id/qa` でその範囲に質問する
+7. Vue フロントエンドを追加する
 
 ## 現在のローカルワークフロー
 
@@ -157,6 +164,18 @@ curl -X POST http://127.0.0.1:3000/api/chunks/<chunk_id>/generate
 
 ```bash
 curl -X POST http://127.0.0.1:3000/api/documents/<document_id>/generate
+```
+
+音声を生成:
+
+```bash
+curl -X POST http://127.0.0.1:3000/api/chunks/<chunk_id>/audio
+```
+
+生成済み音声を再生:
+
+```bash
+curl http://127.0.0.1:3000/audio/<chunk_id>.wav --output sample.wav
 ```
 
 質問する:

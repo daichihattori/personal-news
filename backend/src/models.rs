@@ -24,6 +24,12 @@ pub struct GenerateChunkResponse {
 }
 
 #[derive(Debug, Clone, Serialize)]
+pub struct GenerateAudioResponse {
+    pub chunk: BookChunk,
+    pub audio_url: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
 pub struct GenerateDocumentResponse {
     pub document: Document,
     pub generated_chunks: Vec<BookChunk>,
