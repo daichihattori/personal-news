@@ -22,8 +22,8 @@ use axum::{
 use chrono::Utc;
 use llm::{GeneratedChunkContent, SharedLlmClient, build_llm_client};
 use models::{
-    BookChunk, ChunkListItem, CreatedDocumentResponse, Document, GenerateChunkResponse, QaRequest,
-    QaResponse,
+    BookChunk, ChunkListItem, CreatedDocumentResponse, Document, GenerateChunkResponse,
+    GenerateDocumentResponse, QaRequest, QaResponse,
 };
 use tower_http::{cors::CorsLayer, trace::TraceLayer};
 use tracing::info;
@@ -48,15 +48,17 @@ async fn main() {
         .with_env_filter("personal_news_backend=debug,tower_http=debug")
         .init();
 
+    let data_dir = init_data_dirs();
     let state = AppState {
-        store: Arc::new(RwLock::new(seed_store())),
-        data_dir: init_data_dirs(),
+        store: Arc::new(RwLock::new(load_store(&data_dir))),
+        data_dir,
         llm_client: build_llm_client(),
     };
 
     let app = Router::new()
         .route("/api/health", get(health))
         .route("/api/documents", get(list_documents).post(create_document))
+        .route("/api/documents/{id}/generate", post(generate_document))
         .route("/api/documents/{id}/chunks", get(list_document_chunks))
         .route("/api/chunks/{id}", get(get_chunk))
         .route("/api/chunks/{id}/generate", post(generate_chunk))
@@ -91,7 +93,8 @@ async fn list_documents(State(state): State<AppState>) -> Result<Json<Vec<Docume
         .read()
         .map_err(|_| AppError::internal("failed to read document store"))?;
 
-    let documents = store.documents.values().cloned().collect();
+    let mut documents: Vec<_> = store.documents.values().cloned().collect();
+    documents.sort_by(|a, b| b.created_at.cmp(&a.created_at));
     Ok(Json(documents))
 }
 
@@ -158,6 +161,11 @@ async fn create_document(
         for chunk in &chunks {
             store.chunks.insert(chunk.id.clone(), chunk.clone());
         }
+    }
+
+    persist_document(&state.data_dir, &document)?;
+    for chunk in &chunks {
+        persist_chunk(&state.data_dir, chunk)?;
     }
 
     let response = CreatedDocumentResponse {
@@ -237,91 +245,60 @@ async fn generate_chunk(
     State(state): State<AppState>,
 ) -> Result<Json<GenerateChunkResponse>, AppError> {
     let chunk = read_chunk(&state, &id)?;
-
-    let generated = state
-        .llm_client
-        .generate_chunk_content(&chunk)
-        .await
-        .unwrap_or_else(|_| GeneratedChunkContent {
-            key_points: vec![
-                format!("Pages {}-{} were extracted from the uploaded PDF.", chunk.page_start, chunk.page_end),
-                "Claude generation is unavailable, so this chunk still uses extracted text.".to_string(),
-                "Switching to API-backed generation later only requires replacing the LlmClient implementation.".to_string(),
-            ],
-            summary_text: preview_text(&chunk.source_text, 220),
-            dialogue_script: format!(
-                "ずんだもん: 今回は {} の {}ページから{}ページを読むのだ。内容の冒頭を確認すると、{}",
-                chunk.title,
-                chunk.page_start,
-                chunk.page_end,
-                preview_text(&chunk.source_text, 220)
-            ),
-            qa_context: chunk.source_text.clone(),
-        });
-
-    let updated_chunk = BookChunk {
-        key_points: generated.key_points,
-        summary_text: generated.summary_text,
-        dialogue_script: generated.dialogue_script,
-        qa_context: generated.qa_context,
-        ..chunk
-    };
-
-    {
-        let mut store = state
-            .store
-            .write()
-            .map_err(|_| AppError::internal("failed to update chunk store"))?;
-        store
-            .chunks
-            .insert(updated_chunk.id.clone(), updated_chunk.clone());
-    }
+    let updated_chunk = generate_chunk_content_with_fallback(&state, chunk).await?;
 
     Ok(Json(GenerateChunkResponse {
         chunk: updated_chunk,
     }))
 }
 
-fn seed_store() -> Store {
-    let document_id = Uuid::new_v4().to_string();
-    let chunk_id = Uuid::new_v4().to_string();
-
-    let document = Document {
-        id: document_id.clone(),
-        title: "Sample Book".to_string(),
-        file_name: "sample-book.pdf".to_string(),
-        total_pages: 42,
-        created_at: Utc::now(),
+async fn generate_document(
+    Path(id): Path<String>,
+    State(state): State<AppState>,
+) -> Result<Json<GenerateDocumentResponse>, AppError> {
+    let document = {
+        let store = state
+            .store
+            .read()
+            .map_err(|_| AppError::internal("failed to read document store"))?;
+        store
+            .documents
+            .get(&id)
+            .cloned()
+            .ok_or_else(|| AppError::not_found("document not found"))?
     };
 
-    let chunk = BookChunk {
-        id: chunk_id.clone(),
-        document_id: document_id.clone(),
-        title: "Chapter 1: Why This Matters".to_string(),
-        page_start: 1,
-        page_end: 3,
-        source_text: "This is placeholder source text for the first three pages of the document."
-            .to_string(),
-        key_points: vec![
-            "The author introduces the core problem.".to_string(),
-            "The chapter frames the rest of the book.".to_string(),
-        ],
-        summary_text: "The opening pages explain the central theme and why the topic matters."
-            .to_string(),
-        dialogue_script: "ずんだもん: まず、この本が何を問題にしているかを見るのだ。ここでは、これから扱うテーマの背景が整理されているのだ。"
-            .to_string(),
-        qa_context: "Pages 1-3 introduce the book's main question, explain its context, and set up the argument for the following chapters."
-            .to_string(),
-        audio_path: None,
+    let mut chunk_ids = {
+        let store = state
+            .store
+            .read()
+            .map_err(|_| AppError::internal("failed to read chunk store"))?;
+        store
+            .chunks
+            .values()
+            .filter(|chunk| chunk.document_id == id)
+            .map(|chunk| chunk.id.clone())
+            .collect::<Vec<_>>()
     };
+    chunk_ids.sort();
 
-    let mut documents = HashMap::new();
-    documents.insert(document.id.clone(), document);
+    let mut generated_chunks = Vec::with_capacity(chunk_ids.len());
+    for chunk_id in chunk_ids {
+        let chunk = read_chunk(&state, &chunk_id)?;
+        let updated_chunk = generate_chunk_content_with_fallback(&state, chunk).await?;
+        generated_chunks.push(updated_chunk);
+    }
 
-    let mut chunks = HashMap::new();
-    chunks.insert(chunk.id.clone(), chunk);
+    generated_chunks.sort_by(|a, b| {
+        a.page_start
+            .cmp(&b.page_start)
+            .then_with(|| a.page_end.cmp(&b.page_end))
+    });
 
-    Store { documents, chunks }
+    Ok(Json(GenerateDocumentResponse {
+        document,
+        generated_chunks,
+    }))
 }
 
 fn read_chunk(state: &AppState, id: &str) -> Result<BookChunk, AppError> {
@@ -343,6 +320,129 @@ fn init_data_dirs() -> PathBuf {
         fs::create_dir_all(data_dir.join(name)).expect("failed to create data directories");
     }
     data_dir
+}
+
+fn load_store(data_dir: &FsPath) -> Store {
+    let mut documents = HashMap::new();
+    let mut chunks = HashMap::new();
+
+    let documents_dir = data_dir.join("documents");
+    if let Ok(entries) = fs::read_dir(&documents_dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().and_then(|ext| ext.to_str()) != Some("json") {
+                continue;
+            }
+
+            match fs::read_to_string(&path)
+                .ok()
+                .and_then(|contents| serde_json::from_str::<Document>(&contents).ok())
+            {
+                Some(document) => {
+                    documents.insert(document.id.clone(), document);
+                }
+                None => {
+                    tracing::warn!("failed to load document metadata from {}", path.display());
+                }
+            }
+        }
+    }
+
+    let chunks_dir = data_dir.join("chunks");
+    if let Ok(entries) = fs::read_dir(&chunks_dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().and_then(|ext| ext.to_str()) != Some("json") {
+                continue;
+            }
+
+            match fs::read_to_string(&path)
+                .ok()
+                .and_then(|contents| serde_json::from_str::<BookChunk>(&contents).ok())
+            {
+                Some(chunk) => {
+                    chunks.insert(chunk.id.clone(), chunk);
+                }
+                None => {
+                    tracing::warn!("failed to load chunk metadata from {}", path.display());
+                }
+            }
+        }
+    }
+
+    Store { documents, chunks }
+}
+
+fn persist_document(data_dir: &FsPath, document: &Document) -> Result<(), AppError> {
+    let path = data_dir
+        .join("documents")
+        .join(format!("{}.json", document.id));
+    let json = serde_json::to_string_pretty(document)
+        .map_err(|_| AppError::internal("failed to serialize document metadata"))?;
+    fs::write(path, json).map_err(|_| AppError::internal("failed to persist document metadata"))
+}
+
+fn persist_chunk(data_dir: &FsPath, chunk: &BookChunk) -> Result<(), AppError> {
+    let path = data_dir.join("chunks").join(format!("{}.json", chunk.id));
+    let json = serde_json::to_string_pretty(chunk)
+        .map_err(|_| AppError::internal("failed to serialize chunk metadata"))?;
+    fs::write(path, json).map_err(|_| AppError::internal("failed to persist chunk metadata"))
+}
+
+async fn generate_chunk_content_with_fallback(
+    state: &AppState,
+    chunk: BookChunk,
+) -> Result<BookChunk, AppError> {
+    let generated = state
+        .llm_client
+        .generate_chunk_content(&chunk)
+        .await
+        .unwrap_or_else(|_| fallback_generated_content(&chunk));
+
+    let updated_chunk = BookChunk {
+        key_points: generated.key_points,
+        summary_text: generated.summary_text,
+        dialogue_script: generated.dialogue_script,
+        qa_context: generated.qa_context,
+        ..chunk
+    };
+
+    {
+        let mut store = state
+            .store
+            .write()
+            .map_err(|_| AppError::internal("failed to update chunk store"))?;
+        store
+            .chunks
+            .insert(updated_chunk.id.clone(), updated_chunk.clone());
+    }
+
+    persist_chunk(&state.data_dir, &updated_chunk)?;
+
+    Ok(updated_chunk)
+}
+
+fn fallback_generated_content(chunk: &BookChunk) -> GeneratedChunkContent {
+    GeneratedChunkContent {
+        key_points: vec![
+            format!(
+                "Pages {}-{} were extracted from the uploaded PDF.",
+                chunk.page_start, chunk.page_end
+            ),
+            "Claude generation is unavailable, so this chunk still uses extracted text."
+                .to_string(),
+            "Switching to API-backed generation later only requires replacing the LlmClient implementation.".to_string(),
+        ],
+        summary_text: preview_text(&chunk.source_text, 220),
+        dialogue_script: format!(
+            "ずんだもん: 今回は {} の {}ページから{}ページを読むのだ。内容の冒頭を確認すると、{}",
+            chunk.title,
+            chunk.page_start,
+            chunk.page_end,
+            preview_text(&chunk.source_text, 220)
+        ),
+        qa_context: chunk.source_text.clone(),
+    }
 }
 
 async fn extract_page_count(pdf_path: &FsPath) -> Result<u32, AppError> {

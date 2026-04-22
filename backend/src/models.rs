@@ -23,6 +23,12 @@ pub struct GenerateChunkResponse {
     pub chunk: BookChunk,
 }
 
+#[derive(Debug, Clone, Serialize)]
+pub struct GenerateDocumentResponse {
+    pub document: Document,
+    pub generated_chunks: Vec<BookChunk>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BookChunk {
     pub id: String,

@@ -42,7 +42,7 @@ flowchart TD
 
 - フロントエンド: `Vue`
 - バックエンド: `Rust + axum`
-- LLM: `Claude API`
+- LLM: `Claude Code CLI` を `LlmClient` 経由で呼ぶ
 - 音声合成: `VOICEVOX`
 - 初期保存: ローカルファイル
 - 将来インフラ: `AWS + Terraform`
@@ -93,6 +93,17 @@ pub struct BookChunk {
 
 - ドキュメント一覧取得
 
+### `POST /api/documents`
+
+- PDF アップロード
+- `data/documents/<document_id>.pdf` に保存
+- `data/documents/<document_id>.json` にメタデータ保存
+- `data/chunks/<chunk_id>.json` に chunk 保存
+
+### `POST /api/documents/:id/generate`
+
+- ドキュメントに属する全 chunk を Claude で一括生成
+
 ### `GET /api/documents/:id/chunks`
 
 - ドキュメントに属する chunk 一覧取得
@@ -100,6 +111,10 @@ pub struct BookChunk {
 ### `GET /api/chunks/:id`
 
 - chunk 1 件の詳細取得
+
+### `POST /api/chunks/:id/generate`
+
+- chunk 1 件だけ Claude で生成し直す
 
 ### `POST /api/chunks/:id/qa`
 
@@ -111,12 +126,46 @@ pub struct BookChunk {
 
 ## ローカル開発の進め方
 
-1. `backend/` の axum API を起動する
-2. ダミー `Document` / `BookChunk` を返す
-3. PDF テキスト抽出を入れる
-4. Claude API 連携を入れる
-5. VOICEVOX 連携を入れる
-6. Vue フロントエンドからつなぐ
+1. `claude` CLI にログインする
+2. `backend/` の axum API を起動する
+3. `POST /api/documents` で PDF をアップロードする
+4. `POST /api/chunks/:id/generate` か `POST /api/documents/:id/generate` を呼ぶ
+5. `POST /api/chunks/:id/qa` でその範囲に質問する
+6. VOICEVOX 連携と Vue フロントエンドを追加する
+
+## 現在のローカルワークフロー
+
+```bash
+cd backend
+cargo run
+```
+
+別ターミナルで PDF をアップロード:
+
+```bash
+curl -X POST http://127.0.0.1:3000/api/documents \
+  -F "file=@/absolute/path/to/book.pdf"
+```
+
+一部の chunk を生成:
+
+```bash
+curl -X POST http://127.0.0.1:3000/api/chunks/<chunk_id>/generate
+```
+
+ドキュメント全体を生成:
+
+```bash
+curl -X POST http://127.0.0.1:3000/api/documents/<document_id>/generate
+```
+
+質問する:
+
+```bash
+curl -X POST http://127.0.0.1:3000/api/chunks/<chunk_id>/qa \
+  -H "Content-Type: application/json" \
+  -d '{"question":"この範囲の主張は何？"}'
+```
 
 ## ディレクトリ案
 
