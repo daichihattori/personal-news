@@ -26,7 +26,6 @@ use models::{
     GenerateChunkResponse, GenerateDocumentResponse, QaRequest, QaResponse,
 };
 use reqwest::Client;
-use serde::Deserialize;
 use tower_http::services::ServeDir;
 use tower_http::{cors::CorsLayer, trace::TraceLayer};
 use tracing::info;
@@ -532,7 +531,7 @@ async fn synthesize_with_voicevox(
     }
 
     let voice_query = query
-        .json::<VoicevoxAudioQuery>()
+        .json::<serde_json::Value>()
         .await
         .map_err(|_| AppError::internal("failed to parse VOICEVOX audio_query response"))?;
 
@@ -556,21 +555,6 @@ async fn synthesize_with_voicevox(
         .await
         .map(|bytes| bytes.to_vec())
         .map_err(|_| AppError::internal("failed to read VOICEVOX synthesized audio"))
-}
-
-#[derive(Debug, Clone, Deserialize, serde::Serialize)]
-#[serde(rename_all = "camelCase")]
-struct VoicevoxAudioQuery {
-    accent_phrases: serde_json::Value,
-    speed_scale: f64,
-    pitch_scale: f64,
-    intonation_scale: f64,
-    volume_scale: f64,
-    pre_phoneme_length: f64,
-    post_phoneme_length: f64,
-    output_sampling_rate: u32,
-    output_stereo: bool,
-    kana: Option<String>,
 }
 
 async fn extract_page_count(pdf_path: &FsPath) -> Result<u32, AppError> {
