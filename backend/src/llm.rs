@@ -12,6 +12,7 @@ use crate::{AppError, models::BookChunk};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GeneratedChunkContent {
+    pub title: String,
     pub key_points: Vec<String>,
     pub summary_text: String,
     pub dialogue_script: String,
@@ -48,6 +49,19 @@ pub struct LocalClaudeCliClient {
     command: String,
     home_dir: Option<PathBuf>,
     model: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ChunkAnalysis {
+    title: String,
+    key_points: Vec<String>,
+    summary_text: String,
+    qa_context: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct DialogueDraft {
+    dialogue_script: String,
 }
 
 impl LocalClaudeCliClient {
@@ -118,21 +132,24 @@ impl LlmClient for LocalClaudeCliClient {
         &self,
         chunk: &BookChunk,
     ) -> Result<GeneratedChunkContent, AppError> {
-        let prompt = format!(
-            "You are helping a user study a technical book.\n\
+        let analysis_prompt = format!(
+            "You are analyzing OCR-like extracted pages from a technical book.\n\
+Ignore page numbers, running headers, repeated chapter headers, figure labels, and navigation text unless they are essential to the explanation.\n\
 Return only valid JSON with this exact schema:\n\
-{{\"key_points\":[\"...\"],\"summary_text\":\"...\",\"dialogue_script\":\"...\",\"qa_context\":\"...\"}}\n\
+{{\"title\":\"...\",\"key_points\":[\"...\"],\"summary_text\":\"...\",\"qa_context\":\"...\"}}\n\
 \n\
 Rules:\n\
-- summary_text: concise Japanese summary for UI, 3-5 sentences\n\
-- dialogue_script: Japanese conversational narration for a single Zundamon speaker, natural and easy to listen to\n\
-- qa_context: factual Japanese context for later Q&A, based only on the provided text\n\
-- key_points: 3 short bullet-like strings in Japanese\n\
-- Do not use markdown fences\n\
-- Do not mention information not grounded in the provided text\n\
+- Write everything in Japanese.\n\
+- title: a short section title that reflects the actual topic. Do not include page ranges.\n\
+- key_points: 3 to 5 concrete points grounded in the text.\n\
+- summary_text: 4 to 6 sentences. Explain what this chunk is teaching, why it matters, and what the reader should retain.\n\
+- qa_context: 5 to 10 factual sentences for later Q&A. Include formulas, definitions, code identifiers, or constraints when they matter.\n\
+- If the chunk is still introduction, setup, or exercise guidance rather than core theory, say that explicitly instead of pretending it teaches something else.\n\
+- Do not add facts that are not supported by the text.\n\
+- Do not use markdown fences.\n\
 \n\
 Chunk metadata:\n\
-title: {title}\n\
+document_title: {title}\n\
 page_start: {page_start}\n\
 page_end: {page_end}\n\
 \n\
@@ -144,7 +161,46 @@ Source text:\n\
             source_text = chunk.source_text
         );
 
-        self.run_prompt(prompt).await
+        let analysis: ChunkAnalysis = self.run_prompt(analysis_prompt).await?;
+        let dialogue_prompt = format!(
+            "You are writing a short Japanese reading script for a single-speaker study audio.\n\
+Return only valid JSON with this exact schema:\n\
+{{\"dialogue_script\":\"...\"}}\n\
+\n\
+Rules:\n\
+- The output is for voice synthesis, so write short spoken sentences.\n\
+- Use natural Japanese. Calm, clear, and explanatory. No hype.\n\
+- Start by saying what this chunk is about in plain language.\n\
+- Then explain 2 or 3 important points in order.\n\
+- End with one sentence about what to pay attention to next.\n\
+- No bullet points, no markdown, no role labels, no stage directions.\n\
+- Stay faithful to the structured notes below.\n\
+\n\
+Chunk title:\n\
+{title}\n\
+\n\
+Summary:\n\
+{summary_text}\n\
+\n\
+Key points:\n\
+{key_points}\n\
+\n\
+Q&A context:\n\
+{qa_context}",
+            title = analysis.title,
+            summary_text = analysis.summary_text,
+            key_points = analysis.key_points.join("\n- "),
+            qa_context = analysis.qa_context
+        );
+        let dialogue: DialogueDraft = self.run_prompt(dialogue_prompt).await?;
+
+        Ok(GeneratedChunkContent {
+            title: analysis.title,
+            key_points: analysis.key_points,
+            summary_text: analysis.summary_text,
+            dialogue_script: dialogue.dialogue_script,
+            qa_context: analysis.qa_context,
+        })
     }
 
     async fn answer_question(
@@ -167,6 +223,12 @@ Rules:\n\
 Chunk title: {title}\n\
 Pages: {page_start}-{page_end}\n\
 \n\
+Summary:\n\
+{summary_text}\n\
+\n\
+Key points:\n\
+{key_points}\n\
+\n\
 Context:\n\
 {qa_context}\n\
 \n\
@@ -175,6 +237,8 @@ Question:\n\
             title = chunk.title,
             page_start = chunk.page_start,
             page_end = chunk.page_end,
+            summary_text = chunk.summary_text,
+            key_points = chunk.key_points.join("\n- "),
             qa_context = chunk.qa_context,
             question = question
         );
