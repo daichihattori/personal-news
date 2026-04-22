@@ -1,0 +1,6 @@
+.codex
+backend/target
+data/documents
+data/chunks
+data/audio
+test-obj
