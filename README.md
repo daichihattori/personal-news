@@ -136,11 +136,10 @@ pub struct BookChunk {
 
 1. `claude` CLI にログインする
 2. `backend/` の axum API を起動する
-3. `POST /api/documents` で PDF をアップロードする
-4. `POST /api/chunks/:id/generate` か `POST /api/documents/:id/generate` を呼ぶ
-5. `POST /api/chunks/:id/audio` で音声を生成する
-6. `POST /api/chunks/:id/qa` でその範囲に質問する
-7. Vue フロントエンドを追加する
+3. `VOICEVOX` Engine を起動する
+4. `frontend/` の Vue UI を起動する
+5. ブラウザから PDF をアップロードする
+6. chunk ごとに生成・音声化・Q&A を試す
 
 ## 現在のローカルワークフロー
 
@@ -148,6 +147,35 @@ pub struct BookChunk {
 cd backend
 cargo run
 ```
+
+VOICEVOX を Docker で起動:
+
+```bash
+docker run --rm -p 50021:50021 voicevox/voicevox_engine:cpu-latest
+```
+
+フロントエンドを起動:
+
+```bash
+cd frontend
+npm install
+npm run dev
+```
+
+必要なら API の向き先は `VITE_API_BASE_URL` で変更:
+
+```bash
+VITE_API_BASE_URL=http://127.0.0.1:3000 npm run dev
+```
+
+ブラウザで `http://127.0.0.1:5173` を開くと、以下を 1 画面で操作できる。
+
+- PDF アップロード
+- document / chunk 選択
+- Claude 生成
+- VOICEVOX 音声生成
+- 音声再生
+- chunk 単位 Q&A
 
 別ターミナルで PDF をアップロード:
 
@@ -219,4 +247,4 @@ curl -X POST http://127.0.0.1:3000/api/chunks/<chunk_id>/qa \
 2. chunk のページ幅を `3` か `5` に決める
 3. Claude に返させる JSON スキーマを固定する
 4. VOICEVOX の起動方法を決める
-5. Vue フロントエンドを追加する
+5. フロントに再生キューと現在再生中状態を入れる

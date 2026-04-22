@@ -1,5 +1,7 @@
 .codex
 backend/target
+frontend/node_modules
+frontend/dist
 data/documents
 data/chunks
 data/audio
