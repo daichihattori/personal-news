@@ -31,6 +31,8 @@ use tower_http::{cors::CorsLayer, trace::TraceLayer};
 use tracing::info;
 use uuid::Uuid;
 
+const CHUNK_START_PAGE: u32 = 5;
+
 #[derive(Clone)]
 struct AppState {
     store: Arc<RwLock<Store>>,
@@ -203,7 +205,13 @@ async fn list_document_chunks(
         .values()
         .filter(|chunk| chunk.document_id == id)
         .map(ChunkListItem::from)
-        .collect();
+        .collect::<Vec<_>>();
+    let mut chunks = chunks;
+    chunks.sort_by(|a, b| {
+        a.page_start
+            .cmp(&b.page_start)
+            .then_with(|| a.page_end.cmp(&b.page_end))
+    });
 
     Ok(Json(chunks))
 }
@@ -595,7 +603,11 @@ async fn build_chunks(
     pages_per_chunk: u32,
 ) -> Result<Vec<BookChunk>, AppError> {
     let mut chunks = Vec::new();
-    let mut start = 1;
+    let mut start = CHUNK_START_PAGE;
+
+    if document.total_pages < CHUNK_START_PAGE {
+        return Ok(chunks);
+    }
 
     while start <= document.total_pages {
         let end = (start + pages_per_chunk - 1).min(document.total_pages);
