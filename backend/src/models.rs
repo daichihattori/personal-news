@@ -1,8 +1,6 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
-use crate::llm::QuestionAnswer;
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Document {
     pub id: String,
@@ -12,6 +10,12 @@ pub struct Document {
     pub created_at: DateTime<Utc>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct DialogueTurn {
+    pub speaker: String, // "zundamon" | "metan"
+    pub text: String,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct CreatedDocumentResponse {
     pub document: Document,
@@ -19,27 +23,16 @@ pub struct CreatedDocumentResponse {
 }
 
 #[derive(Debug, Clone, Serialize)]
-pub struct GenerateChunkResponse {
-    pub chunk: BookChunk,
+pub struct GenerateDocumentResponse {
+    pub document: Document,
+    pub chunks: Vec<BookChunk>,
+    pub model: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
 pub struct GenerateAudioResponse {
     pub chunk: BookChunk,
     pub audio_url: String,
-}
-
-#[derive(Debug, Clone, Serialize)]
-pub struct GenerateDocumentResponse {
-    pub document: Document,
-    pub generated_chunks: Vec<BookChunk>,
-}
-
-#[derive(Debug, Clone, Serialize)]
-pub struct ProcessGeminiDocumentResponse {
-    pub document: Document,
-    pub chunks: Vec<BookChunk>,
-    pub model: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -52,7 +45,10 @@ pub struct BookChunk {
     pub source_text: String,
     pub key_points: Vec<String>,
     pub summary_text: String,
+    #[serde(default)]
     pub dialogue_script: String,
+    #[serde(default)]
+    pub dialogue_turns: Vec<DialogueTurn>,
     pub qa_context: String,
     pub audio_path: Option<String>,
 }
@@ -76,26 +72,6 @@ impl From<&BookChunk> for ChunkListItem {
             page_end: chunk.page_end,
             summary_text: chunk.summary_text.clone(),
             audio_path: chunk.audio_path.clone(),
-        }
-    }
-}
-
-#[derive(Debug, Clone, Deserialize)]
-pub struct QaRequest {
-    pub question: String,
-}
-
-#[derive(Debug, Clone, Serialize)]
-pub struct QaResponse {
-    pub answer: String,
-    pub references: Vec<String>,
-}
-
-impl From<QuestionAnswer> for QaResponse {
-    fn from(value: QuestionAnswer) -> Self {
-        Self {
-            answer: value.answer,
-            references: value.references,
         }
     }
 }

@@ -1,4 +1,3 @@
-mod llm;
 mod models;
 
 use std::{
@@ -14,18 +13,16 @@ use axum::{
     Json, Router,
     extract::DefaultBodyLimit,
     extract::Multipart,
-    extract::{Path, State},
+    extract::{Path, Query, State},
     http::StatusCode,
     response::IntoResponse,
-    routing::{get, post},
+    routing::{delete, get, post},
 };
 use base64::{Engine as _, engine::general_purpose};
 use chrono::Utc;
-use llm::{GeneratedChunkContent, SharedLlmClient, build_llm_client};
 use models::{
     BookChunk, ChunkListItem, CreatedDocumentResponse, Document, GenerateAudioResponse,
-    GenerateChunkResponse, GenerateDocumentResponse, ProcessGeminiDocumentResponse, QaRequest,
-    QaResponse,
+    GenerateDocumentResponse,
 };
 use reqwest::Client;
 use serde::Deserialize;
@@ -42,7 +39,6 @@ const MAX_CHUNK_PAGES: usize = 4;
 struct AppState {
     store: Arc<RwLock<Store>>,
     data_dir: PathBuf,
-    llm_client: SharedLlmClient,
     http_client: Client,
     voicevox_base_url: String,
     gemini_config: Option<GeminiConfig>,
@@ -62,6 +58,8 @@ struct Store {
 
 #[tokio::main]
 async fn main() {
+    let _ = dotenvy::from_filename("../.env").or_else(|_| dotenvy::dotenv());
+
     tracing_subscriber::fmt()
         .with_env_filter("personal_news_backend=debug,tower_http=debug")
         .init();
@@ -70,7 +68,6 @@ async fn main() {
     let state = AppState {
         store: Arc::new(RwLock::new(load_store(&data_dir))),
         data_dir,
-        llm_client: build_llm_client(),
         http_client: Client::new(),
         voicevox_base_url: env::var("VOICEVOX_BASE_URL")
             .unwrap_or_else(|_| "http://127.0.0.1:50021".to_string()),
@@ -80,16 +77,11 @@ async fn main() {
     let app = Router::new()
         .route("/api/health", get(health))
         .route("/api/documents", get(list_documents).post(create_document))
+        .route("/api/documents/{id}", delete(delete_document))
         .route("/api/documents/{id}/generate", post(generate_document))
-        .route(
-            "/api/documents/{id}/process-gemini",
-            post(process_document_with_gemini),
-        )
         .route("/api/documents/{id}/chunks", get(list_document_chunks))
         .route("/api/chunks/{id}", get(get_chunk))
-        .route("/api/chunks/{id}/generate", post(generate_chunk))
         .route("/api/chunks/{id}/audio", post(generate_audio))
-        .route("/api/chunks/{id}/qa", post(answer_chunk_question))
         .nest_service("/audio", ServeDir::new(state.data_dir.join("audio")))
         .layer(DefaultBodyLimit::max(32 * 1024 * 1024))
         .with_state(state)
@@ -124,6 +116,57 @@ async fn list_documents(State(state): State<AppState>) -> Result<Json<Vec<Docume
     let mut documents: Vec<_> = store.documents.values().cloned().collect();
     documents.sort_by(|a, b| b.created_at.cmp(&a.created_at));
     Ok(Json(documents))
+}
+
+async fn delete_document(
+    Path(id): Path<String>,
+    State(state): State<AppState>,
+) -> Result<StatusCode, AppError> {
+    let chunk_ids_and_audio: Vec<(String, Option<String>)> = {
+        let store = state
+            .store
+            .read()
+            .map_err(|_| AppError::internal("failed to read store"))?;
+        if !store.documents.contains_key(&id) {
+            return Err(AppError::not_found("document not found"));
+        }
+        store
+            .chunks
+            .values()
+            .filter(|c| c.document_id == id)
+            .map(|c| (c.id.clone(), c.audio_path.clone()))
+            .collect()
+    };
+
+    {
+        let mut store = state
+            .store
+            .write()
+            .map_err(|_| AppError::internal("failed to write store"))?;
+        store.documents.remove(&id);
+        for (chunk_id, _) in &chunk_ids_and_audio {
+            store.chunks.remove(chunk_id);
+        }
+    }
+
+    let _ = fs::remove_file(state.data_dir.join("documents").join(format!("{id}.json")));
+    let _ = fs::remove_file(state.data_dir.join("documents").join(format!("{id}.pdf")));
+
+    for (chunk_id, audio_path) in chunk_ids_and_audio {
+        let _ = fs::remove_file(
+            state
+                .data_dir
+                .join("chunks")
+                .join(format!("{chunk_id}.json")),
+        );
+        if let Some(path) = audio_path {
+            if let Some(file_name) = FsPath::new(&path).file_name() {
+                let _ = fs::remove_file(state.data_dir.join("audio").join(file_name));
+            }
+        }
+    }
+
+    Ok(StatusCode::NO_CONTENT)
 }
 
 async fn create_document(
@@ -251,43 +294,14 @@ async fn get_chunk(
     Ok(Json(chunk))
 }
 
-async fn answer_chunk_question(
-    Path(id): Path<String>,
-    State(state): State<AppState>,
-    Json(payload): Json<QaRequest>,
-) -> Result<Json<QaResponse>, AppError> {
-    let chunk = read_chunk(&state, &id)?;
-
-    let response = state
-        .llm_client
-        .answer_question(&chunk, &payload.question)
-        .await
-        .map(QaResponse::from)
-        .unwrap_or_else(|_| QaResponse {
-            answer: format!(
-                "Stub answer for chunk {} (pages {}-{}): '{}' is not wired to Claude yet. Use qa_context as the source of truth.",
-                chunk.title, chunk.page_start, chunk.page_end, payload.question
-            ),
-            references: vec![format!("pages {}-{}", chunk.page_start, chunk.page_end)],
-        });
-
-    Ok(Json(response))
-}
-
-async fn generate_chunk(
-    Path(id): Path<String>,
-    State(state): State<AppState>,
-) -> Result<Json<GenerateChunkResponse>, AppError> {
-    let chunk = read_chunk(&state, &id)?;
-    let updated_chunk = generate_chunk_content_with_fallback(&state, chunk).await?;
-
-    Ok(Json(GenerateChunkResponse {
-        chunk: updated_chunk,
-    }))
+#[derive(Debug, Deserialize)]
+struct GenerateQuery {
+    model: Option<String>,
 }
 
 async fn generate_document(
     Path(id): Path<String>,
+    Query(query): Query<GenerateQuery>,
     State(state): State<AppState>,
 ) -> Result<Json<GenerateDocumentResponse>, AppError> {
     let document = {
@@ -302,71 +316,25 @@ async fn generate_document(
             .ok_or_else(|| AppError::not_found("document not found"))?
     };
 
-    let mut chunk_ids = {
-        let store = state
-            .store
-            .read()
-            .map_err(|_| AppError::internal("failed to read chunk store"))?;
-        store
-            .chunks
-            .values()
-            .filter(|chunk| chunk.document_id == id)
-            .map(|chunk| chunk.id.clone())
-            .collect::<Vec<_>>()
-    };
-    chunk_ids.sort();
-
-    let mut generated_chunks = Vec::with_capacity(chunk_ids.len());
-    for chunk_id in chunk_ids {
-        let chunk = read_chunk(&state, &chunk_id)?;
-        let updated_chunk = generate_chunk_content_with_fallback(&state, chunk).await?;
-        generated_chunks.push(updated_chunk);
-    }
-
-    generated_chunks.sort_by(|a, b| {
-        a.page_start
-            .cmp(&b.page_start)
-            .then_with(|| a.page_end.cmp(&b.page_end))
-    });
-
-    Ok(Json(GenerateDocumentResponse {
-        document,
-        generated_chunks,
-    }))
-}
-
-async fn process_document_with_gemini(
-    Path(id): Path<String>,
-    State(state): State<AppState>,
-) -> Result<Json<ProcessGeminiDocumentResponse>, AppError> {
-    let document = {
-        let store = state
-            .store
-            .read()
-            .map_err(|_| AppError::internal("failed to read document store"))?;
-        store
-            .documents
-            .get(&id)
-            .cloned()
-            .ok_or_else(|| AppError::not_found("document not found"))?
-    };
-
-    let config = state
+    let mut config = state
         .gemini_config
         .clone()
         .ok_or_else(|| AppError::bad_request("GEMINI_API_KEY is not configured"))?;
+    if let Some(model) = query.model {
+        config.fallback_models = vec![normalize_gemini_model(&model).to_string()];
+    }
     let pdf_path = state
         .data_dir
         .join("documents")
         .join(format!("{}.pdf", document.id));
-    let (generated, model) =
+    let (chunks, model) =
         generate_chunks_with_gemini(&state.http_client, &config, &document, &pdf_path).await?;
 
-    replace_document_chunks(&state, &document.id, &generated)?;
+    replace_document_chunks(&state, &document.id, &chunks)?;
 
-    Ok(Json(ProcessGeminiDocumentResponse {
+    Ok(Json(GenerateDocumentResponse {
         document,
-        chunks: generated,
+        chunks,
         model,
     }))
 }
@@ -375,7 +343,17 @@ async fn generate_audio(
     Path(id): Path<String>,
     State(state): State<AppState>,
 ) -> Result<Json<GenerateAudioResponse>, AppError> {
-    let chunk = read_chunk(&state, &id)?;
+    let chunk = {
+        let store = state
+            .store
+            .read()
+            .map_err(|_| AppError::internal("failed to read chunk store"))?;
+        store
+            .chunks
+            .get(id.as_str())
+            .cloned()
+            .ok_or_else(|| AppError::not_found("chunk not found"))?
+    };
     let updated_chunk = synthesize_chunk_audio(&state, chunk).await?;
     let audio_url = updated_chunk
         .audio_path
@@ -386,19 +364,6 @@ async fn generate_audio(
         chunk: updated_chunk,
         audio_url,
     }))
-}
-
-fn read_chunk(state: &AppState, id: &str) -> Result<BookChunk, AppError> {
-    let store = state
-        .store
-        .read()
-        .map_err(|_| AppError::internal("failed to read chunk store"))?;
-
-    store
-        .chunks
-        .get(id)
-        .cloned()
-        .ok_or_else(|| AppError::not_found("chunk not found"))
 }
 
 fn init_data_dirs() -> PathBuf {
@@ -420,7 +385,7 @@ fn build_gemini_config() -> Option<GeminiConfig> {
 }
 
 fn gemini_model_candidates(primary_model: &str) -> Vec<String> {
-    let mut models = vec![primary_model.to_string()];
+    let mut models = vec![normalize_gemini_model(primary_model).to_string()];
     let env_fallbacks = env::var("GEMINI_FALLBACK_MODELS")
         .unwrap_or_else(|_| "gemini-2.5-flash-lite,gemini-2.5-pro".to_string());
 
@@ -429,12 +394,21 @@ fn gemini_model_candidates(primary_model: &str) -> Vec<String> {
         .map(str::trim)
         .filter(|model| !model.is_empty())
     {
+        let model = normalize_gemini_model(model);
         if !models.iter().any(|candidate| candidate == model) {
             models.push(model.to_string());
         }
     }
 
     models
+}
+
+fn normalize_gemini_model(model: &str) -> &str {
+    match model.trim() {
+        "gemini-1.5-flash" | "models/gemini-1.5-flash" => "gemini-2.5-flash-lite",
+        "gemini-1.5-pro" | "models/gemini-1.5-pro" => "gemini-2.5-pro",
+        value => value,
+    }
 }
 
 fn load_store(data_dir: &FsPath) -> Store {
@@ -557,6 +531,12 @@ struct GeminiChunks {
 }
 
 #[derive(Debug, Deserialize)]
+struct GeminiDialogueTurn {
+    speaker: String,
+    text: String,
+}
+
+#[derive(Debug, Deserialize)]
 struct GeminiChunk {
     title: String,
     page_start: u32,
@@ -564,7 +544,10 @@ struct GeminiChunk {
     source_text: String,
     key_points: Vec<String>,
     summary_text: String,
+    #[serde(default)]
     dialogue_script: String,
+    #[serde(default)]
+    dialogue_turns: Vec<GeminiDialogueTurn>,
     qa_context: String,
 }
 
@@ -680,18 +663,30 @@ async fn generate_chunks_with_gemini(
     let mut chunks = parsed
         .chunks
         .into_iter()
-        .map(|chunk| BookChunk {
-            id: Uuid::new_v4().to_string(),
-            document_id: document.id.clone(),
-            title: chunk.title,
-            page_start: chunk.page_start,
-            page_end: chunk.page_end,
-            source_text: chunk.source_text,
-            key_points: chunk.key_points,
-            summary_text: chunk.summary_text,
-            dialogue_script: chunk.dialogue_script,
-            qa_context: chunk.qa_context,
-            audio_path: None,
+        .map(|chunk| {
+            use models::DialogueTurn;
+            let dialogue_turns: Vec<DialogueTurn> = chunk
+                .dialogue_turns
+                .into_iter()
+                .map(|t| DialogueTurn {
+                    speaker: t.speaker,
+                    text: t.text,
+                })
+                .collect();
+            BookChunk {
+                id: Uuid::new_v4().to_string(),
+                document_id: document.id.clone(),
+                title: chunk.title,
+                page_start: chunk.page_start,
+                page_end: chunk.page_end,
+                source_text: chunk.source_text,
+                key_points: chunk.key_points,
+                summary_text: chunk.summary_text,
+                dialogue_script: chunk.dialogue_script,
+                dialogue_turns,
+                qa_context: chunk.qa_context,
+                audio_path: None,
+            }
         })
         .collect::<Vec<_>>();
 
@@ -758,23 +753,35 @@ async fn call_gemini_generate_content(
 
 fn build_gemini_processing_prompt(document: &Document) -> String {
     format!(
-        "あなたは技術書PDFを、学習用の音声解説アプリ向けに構造化するアシスタントです。\n\
-PDFの本文、見出し階層、コード、表、図、キャプション、数式、ページ内レイアウトを確認し、章または節に近いまとまりでchunkを作ってください。\n\
-Return only valid JSON with this exact schema:\n\
-{{\"chunks\":[{{\"title\":\"...\",\"page_start\":5,\"page_end\":8,\"source_text\":\"...\",\"key_points\":[\"...\"],\"summary_text\":\"...\",\"dialogue_script\":\"...\",\"qa_context\":\"...\"}}]}}\n\
+        "あなたは「ずんだもんラジオ」の台本ライターです。添付されたPDFを読み込み、10〜15分のラジオ番組台本を1本生成してください。\n\
 \n\
-Rules:\n\
-- すべて日本語で書く。\n\
-- 先頭の表紙、目次、権利表示、前付けだけのページは原則として除外する。本文が始まるページからchunk化する。\n\
-- chunkは章/節/見出し単位を優先する。細かすぎる分割は避ける。\n\
-- page_start/page_endはPDFビューア上のページ番号に対応する整数にする。\n\
-- source_textは全文転記ではなく、後続Q&Aで根拠として使える構造化メモにする。重要な定義、コード識別子、数式、表や図の要点を含める。\n\
-- key_pointsは3から6個。PDFに根拠がある具体点だけにする。\n\
-- summary_textは4から8文。何を教える範囲か、なぜ重要か、何を覚えるべきかを説明する。\n\
-- dialogue_scriptはVOICEVOXで読み上げる単独話者の自然な日本語原稿にする。箇条書き、Markdown、役名、演出指示は使わない。\n\
-- qa_contextはQ&A用の事実メモにする。PDFにない推測は入れない。\n\
-- 図表が重要なら、見た目から読み取れる関係や傾向もsource_textとqa_contextに含める。\n\
-- JSON以外の説明やMarkdown fenceは出力しない。\n\
+【出演者】\n\
+ずんだもん：元気いっぱいで好奇心旺盛。語尾に「〜なのだ」「〜のだ」を自然に混ぜる。難しい内容を「例えると」「ざっくり言うと」で噛み砕く。\n\
+四国めたん：知的でちょっとツンデレ。語尾に「〜わ」「〜かしら」「〜ね」を自然に混ぜる。ずんだもんの解説に補足やツッコミを入れる。\n\
+\n\
+【番組の雰囲気】\n\
+「この論文、何の役に立つの？」「だから何がすごいの？」を中心に掛け合いで進める。学術的な正確さよりも「聞いていて面白い」を最優先にする。例え話や身近なたとえを積極的に使う。テンポよくボケとツッコミが入る。技術的な詳細は最小限に抑え、「なぜ面白いか」「世界が変わるとしたら何が？」を優先する。\n\
+\n\
+【出力形式】\n\
+以下のJSON形式のみで返答すること。それ以外は出力しない：\n\
+{{\"chunks\":[{{\"title\":\"...\",\"page_start\":1,\"page_end\":{total_pages},\"source_text\":\"...\",\"key_points\":[\"...\"],\"summary_text\":\"...\",\"dialogue_turns\":[{{\"speaker\":\"zundamon\",\"text\":\"...\"}},{{\"speaker\":\"metan\",\"text\":\"...\"}}],\"qa_context\":\"...\"}}]}}\n\
+\n\
+【チャンク構成】\n\
+chunksは1つだけ生成する。page_start=1、page_end={total_pages}。titleはラジオ番組らしい日本語タイトルにする。\n\
+\n\
+【dialogue_turnsの書き方】\n\
+speakerは「zundamon」または「metan」のみ使う。ずんだもんから始め、交互に20〜35ターン生成する。各ターンは1〜3文、自然な会話の流れにする。\n\
+冒頭はずんだもんの「ハイどうもー！ずんだもんのペーパーラジオへようこそなのだ！今日は〜をやっていくのだ！」から始める。\n\
+めたんの最初の反応は「また変な論文持ってきたわね」などの軽いツッコミにする。\n\
+本編は「この論文の一番すごいところって何？」から始め、重要なポイントを掛け合いで紹介する。\n\
+全体の文字数は3000〜4500文字を目安にする。\n\
+締めはずんだもんの「今日のペーパーラジオはここまでなのだ！また次回もよろしくなのだ！」で終わる。\n\
+\n\
+【VOICEVOX制約】\n\
+記号・絵文字・箇条書き・Markdown・数式・英数字の羅列は使わない。数式は言葉で説明する。役名・ト書き・演出指示は書かない。JSON以外の説明やMarkdown fenceは出力しない。\n\
+\n\
+【その他フィールド】\n\
+source_text：PDFの主要な内容をまとめたメモ（Q&A用）。key_points：3〜5個、このPDFの重要なポイント。summary_text：3〜5文でPDF全体の概要。qa_context：Q&A用の事実メモ（PDFにない推測は入れない）。\n\
 \n\
 Document title: {title}\n\
 Original file name: {file_name}\n\
@@ -785,77 +792,98 @@ Total pages: {total_pages}",
     )
 }
 
-async fn generate_chunk_content_with_fallback(
-    state: &AppState,
-    chunk: BookChunk,
-) -> Result<BookChunk, AppError> {
-    let generated = state
-        .llm_client
-        .generate_chunk_content(&chunk)
-        .await
-        .unwrap_or_else(|_| fallback_generated_content(&chunk));
-
-    let updated_chunk = BookChunk {
-        title: generated.title,
-        key_points: generated.key_points,
-        summary_text: generated.summary_text,
-        dialogue_script: generated.dialogue_script,
-        qa_context: generated.qa_context,
-        ..chunk
-    };
-
-    {
-        let mut store = state
-            .store
-            .write()
-            .map_err(|_| AppError::internal("failed to update chunk store"))?;
-        store
-            .chunks
-            .insert(updated_chunk.id.clone(), updated_chunk.clone());
+fn speaker_id(speaker: &str) -> u32 {
+    match speaker {
+        "metan" => 2,
+        _ => 3, // zundamon default
     }
-
-    persist_chunk(&state.data_dir, &updated_chunk)?;
-
-    Ok(updated_chunk)
 }
 
-fn fallback_generated_content(chunk: &BookChunk) -> GeneratedChunkContent {
-    GeneratedChunkContent {
-        title: chunk.title.clone(),
-        key_points: vec![
-            format!(
-                "{}ページから{}ページの本文を読み取りました。",
-                chunk.page_start, chunk.page_end
-            ),
-            "Claude 生成が使えないため、抽出テキストをもとに暫定の説明を作っています。".to_string(),
-            "見出しと本文を確認してから、必要に応じて再生成してください。".to_string(),
-        ],
-        summary_text: format!(
-            "{}ページから{}ページの抽出結果です。現状は自動要約が使えないため、本文の冒頭だけを表示しています。{}",
-            chunk.page_start,
-            chunk.page_end,
-            preview_text(&chunk.source_text, 180)
-        ),
-        dialogue_script: format!(
-            "今回は {} の {}ページから{}ページを見ます。まだきちんとした要約は作れていないので、まずは抽出できた本文の冒頭を確認します。{}",
-            chunk.title,
-            chunk.page_start,
-            chunk.page_end,
-            preview_text(&chunk.source_text, 180)
-        ),
-        qa_context: chunk.source_text.clone(),
+fn extract_wav_pcm(wav: &[u8]) -> &[u8] {
+    // Find "data" chunk marker and return the raw PCM bytes
+    for i in 0..wav.len().saturating_sub(8) {
+        if wav[i..i + 4] == *b"data" {
+            let data_size =
+                u32::from_le_bytes(wav[i + 4..i + 8].try_into().unwrap_or([0; 4])) as usize;
+            let start = i + 8;
+            let end = (start + data_size).min(wav.len());
+            return &wav[start..end];
+        }
     }
+    &[]
+}
+
+fn build_wav(pcm: &[u8]) -> Vec<u8> {
+    // VOICEVOX outputs 24000 Hz, 16-bit, mono
+    let sample_rate: u32 = 24000;
+    let channels: u16 = 1;
+    let bits: u16 = 16;
+    let byte_rate = sample_rate * channels as u32 * bits as u32 / 8;
+    let block_align = channels * bits / 8;
+    let data_size = pcm.len() as u32;
+    let mut out = Vec::with_capacity(44 + pcm.len());
+    out.extend_from_slice(b"RIFF");
+    out.extend_from_slice(&(data_size + 36).to_le_bytes());
+    out.extend_from_slice(b"WAVE");
+    out.extend_from_slice(b"fmt ");
+    out.extend_from_slice(&16u32.to_le_bytes());
+    out.extend_from_slice(&1u16.to_le_bytes());
+    out.extend_from_slice(&channels.to_le_bytes());
+    out.extend_from_slice(&sample_rate.to_le_bytes());
+    out.extend_from_slice(&byte_rate.to_le_bytes());
+    out.extend_from_slice(&block_align.to_le_bytes());
+    out.extend_from_slice(&bits.to_le_bytes());
+    out.extend_from_slice(b"data");
+    out.extend_from_slice(&data_size.to_le_bytes());
+    out.extend_from_slice(pcm);
+    out
+}
+
+fn concatenate_wavs(wavs: &[Vec<u8>], pause_ms: u32) -> Vec<u8> {
+    // 400ms silence at 24000 Hz 16-bit mono = 24000 * 0.4 * 2 bytes
+    let silence_bytes = (24000 * pause_ms / 1000 * 2) as usize;
+    let silence = vec![0u8; silence_bytes];
+    let mut pcm = Vec::new();
+    for (i, wav) in wavs.iter().enumerate() {
+        if i > 0 {
+            pcm.extend_from_slice(&silence);
+        }
+        pcm.extend_from_slice(extract_wav_pcm(wav));
+    }
+    build_wav(&pcm)
 }
 
 async fn synthesize_chunk_audio(state: &AppState, chunk: BookChunk) -> Result<BookChunk, AppError> {
-    let script = if chunk.dialogue_script.trim().is_empty() {
-        return Err(AppError::bad_request("dialogue_script is empty"));
+    let audio_bytes = if !chunk.dialogue_turns.is_empty() {
+        let mut turn_wavs = Vec::new();
+        for turn in &chunk.dialogue_turns {
+            if turn.text.trim().is_empty() {
+                continue;
+            }
+            let wav = synthesize_with_voicevox(
+                &state.http_client,
+                &state.voicevox_base_url,
+                &turn.text,
+                speaker_id(&turn.speaker),
+            )
+            .await?;
+            turn_wavs.push(wav);
+        }
+        if turn_wavs.is_empty() {
+            return Err(AppError::bad_request("dialogue_turns are all empty"));
+        }
+        concatenate_wavs(&turn_wavs, 400)
+    } else if !chunk.dialogue_script.trim().is_empty() {
+        synthesize_with_voicevox(
+            &state.http_client,
+            &state.voicevox_base_url,
+            &chunk.dialogue_script,
+            3,
+        )
+        .await?
     } else {
-        chunk.dialogue_script.clone()
+        return Err(AppError::bad_request("no dialogue content to synthesize"));
     };
-
-    let audio_bytes =
-        synthesize_with_voicevox(&state.http_client, &state.voicevox_base_url, &script, 3).await?;
 
     let file_name = format!("{}.wav", chunk.id);
     let audio_path = state.data_dir.join("audio").join(&file_name);
@@ -1173,6 +1201,7 @@ fn build_chunk_from_pages(
             "今回は {} を見ます。まだ整理前なので、まずは本文の冒頭を確認します。{}",
             title, preview
         ),
+        dialogue_turns: vec![],
         qa_context: source_text,
         audio_path: None,
     })
@@ -1385,5 +1414,13 @@ mod tests {
                 .count(),
             1
         );
+    }
+
+    #[test]
+    fn normalizes_removed_gemini_15_flash_model() {
+        let models = gemini_model_candidates("gemini-1.5-flash");
+
+        assert_eq!(models[0], "gemini-2.5-flash-lite");
+        assert!(!models.contains(&"gemini-1.5-flash".to_string()));
     }
 }
