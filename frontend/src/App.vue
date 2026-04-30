@@ -20,6 +20,7 @@ const loadingDocuments = ref(false)
 const loadingChunks = ref(false)
 const loadingChunkDetail = ref(false)
 const generatingDocument = ref(false)
+const processingGemini = ref(false)
 const generatingChunk = ref(false)
 const generatingAudio = ref(false)
 const askingQuestion = ref(false)
@@ -182,6 +183,25 @@ async function generateDocument() {
   }
 }
 
+async function processDocumentWithGemini() {
+  if (!selectedDocumentId.value) return
+  processingGemini.value = true
+  try {
+    const response = await request(`/api/documents/${selectedDocumentId.value}/process-gemini`, {
+      method: 'POST'
+    })
+    const result = await response.json()
+    statusMessage.value = `Gemini (${result.model}) で ${result.chunks.length} 件の chunk を作成しました。`
+    selectedChunkId.value = ''
+    selectedChunk.value = null
+    await refreshChunks(selectedDocumentId.value)
+  } catch (error) {
+    statusMessage.value = `Gemini 処理失敗: ${error.message}`
+  } finally {
+    processingGemini.value = false
+  }
+}
+
 async function generateSelectedChunk() {
   if (!selectedChunkId.value) return
   generatingChunk.value = true
@@ -280,6 +300,9 @@ async function askQuestion() {
         <div class="document-actions">
           <button class="primary-button" @click="generateDocument" :disabled="!selectedDocumentId || generatingDocument">
             {{ generatingDocument ? '生成中...' : 'Document 全体を生成' }}
+          </button>
+          <button class="secondary-button" @click="processDocumentWithGemini" :disabled="!selectedDocumentId || processingGemini">
+            {{ processingGemini ? 'Gemini 処理中...' : 'Gemini で再chunk' }}
           </button>
         </div>
       </div>

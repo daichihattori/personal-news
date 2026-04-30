@@ -35,6 +35,13 @@ pub struct GenerateDocumentResponse {
     pub generated_chunks: Vec<BookChunk>,
 }
 
+#[derive(Debug, Clone, Serialize)]
+pub struct ProcessGeminiDocumentResponse {
+    pub document: Document,
+    pub chunks: Vec<BookChunk>,
+    pub model: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BookChunk {
     pub id: String,

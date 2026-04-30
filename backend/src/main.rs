@@ -19,13 +19,16 @@ use axum::{
     response::IntoResponse,
     routing::{get, post},
 };
+use base64::{Engine as _, engine::general_purpose};
 use chrono::Utc;
 use llm::{GeneratedChunkContent, SharedLlmClient, build_llm_client};
 use models::{
     BookChunk, ChunkListItem, CreatedDocumentResponse, Document, GenerateAudioResponse,
-    GenerateChunkResponse, GenerateDocumentResponse, QaRequest, QaResponse,
+    GenerateChunkResponse, GenerateDocumentResponse, ProcessGeminiDocumentResponse, QaRequest,
+    QaResponse,
 };
 use reqwest::Client;
+use serde::Deserialize;
 use tower_http::services::ServeDir;
 use tower_http::{cors::CorsLayer, trace::TraceLayer};
 use tracing::info;
@@ -42,6 +45,13 @@ struct AppState {
     llm_client: SharedLlmClient,
     http_client: Client,
     voicevox_base_url: String,
+    gemini_config: Option<GeminiConfig>,
+}
+
+#[derive(Clone)]
+struct GeminiConfig {
+    api_key: String,
+    fallback_models: Vec<String>,
 }
 
 #[derive(Default)]
@@ -64,12 +74,17 @@ async fn main() {
         http_client: Client::new(),
         voicevox_base_url: env::var("VOICEVOX_BASE_URL")
             .unwrap_or_else(|_| "http://127.0.0.1:50021".to_string()),
+        gemini_config: build_gemini_config(),
     };
 
     let app = Router::new()
         .route("/api/health", get(health))
         .route("/api/documents", get(list_documents).post(create_document))
         .route("/api/documents/{id}/generate", post(generate_document))
+        .route(
+            "/api/documents/{id}/process-gemini",
+            post(process_document_with_gemini),
+        )
         .route("/api/documents/{id}/chunks", get(list_document_chunks))
         .route("/api/chunks/{id}", get(get_chunk))
         .route("/api/chunks/{id}/generate", post(generate_chunk))
@@ -320,6 +335,42 @@ async fn generate_document(
     }))
 }
 
+async fn process_document_with_gemini(
+    Path(id): Path<String>,
+    State(state): State<AppState>,
+) -> Result<Json<ProcessGeminiDocumentResponse>, AppError> {
+    let document = {
+        let store = state
+            .store
+            .read()
+            .map_err(|_| AppError::internal("failed to read document store"))?;
+        store
+            .documents
+            .get(&id)
+            .cloned()
+            .ok_or_else(|| AppError::not_found("document not found"))?
+    };
+
+    let config = state
+        .gemini_config
+        .clone()
+        .ok_or_else(|| AppError::bad_request("GEMINI_API_KEY is not configured"))?;
+    let pdf_path = state
+        .data_dir
+        .join("documents")
+        .join(format!("{}.pdf", document.id));
+    let (generated, model) =
+        generate_chunks_with_gemini(&state.http_client, &config, &document, &pdf_path).await?;
+
+    replace_document_chunks(&state, &document.id, &generated)?;
+
+    Ok(Json(ProcessGeminiDocumentResponse {
+        document,
+        chunks: generated,
+        model,
+    }))
+}
+
 async fn generate_audio(
     Path(id): Path<String>,
     State(state): State<AppState>,
@@ -356,6 +407,34 @@ fn init_data_dirs() -> PathBuf {
         fs::create_dir_all(data_dir.join(name)).expect("failed to create data directories");
     }
     data_dir
+}
+
+fn build_gemini_config() -> Option<GeminiConfig> {
+    env::var("GEMINI_API_KEY").ok().map(|api_key| {
+        let model = env::var("GEMINI_MODEL").unwrap_or_else(|_| "gemini-2.5-flash".to_string());
+        GeminiConfig {
+            fallback_models: gemini_model_candidates(&model),
+            api_key,
+        }
+    })
+}
+
+fn gemini_model_candidates(primary_model: &str) -> Vec<String> {
+    let mut models = vec![primary_model.to_string()];
+    let env_fallbacks = env::var("GEMINI_FALLBACK_MODELS")
+        .unwrap_or_else(|_| "gemini-2.5-flash-lite,gemini-2.5-pro".to_string());
+
+    for model in env_fallbacks
+        .split(',')
+        .map(str::trim)
+        .filter(|model| !model.is_empty())
+    {
+        if !models.iter().any(|candidate| candidate == model) {
+            models.push(model.to_string());
+        }
+    }
+
+    models
 }
 
 fn load_store(data_dir: &FsPath) -> Store {
@@ -425,6 +504,287 @@ fn persist_chunk(data_dir: &FsPath, chunk: &BookChunk) -> Result<(), AppError> {
     fs::write(path, json).map_err(|_| AppError::internal("failed to persist chunk metadata"))
 }
 
+fn replace_document_chunks(
+    state: &AppState,
+    document_id: &str,
+    chunks: &[BookChunk],
+) -> Result<(), AppError> {
+    let old_chunk_ids = {
+        let mut store = state
+            .store
+            .write()
+            .map_err(|_| AppError::internal("failed to update chunk store"))?;
+        let old_chunk_ids = store
+            .chunks
+            .values()
+            .filter(|chunk| chunk.document_id == document_id)
+            .map(|chunk| chunk.id.clone())
+            .collect::<Vec<_>>();
+
+        for chunk_id in &old_chunk_ids {
+            store.chunks.remove(chunk_id);
+        }
+
+        for chunk in chunks {
+            store.chunks.insert(chunk.id.clone(), chunk.clone());
+        }
+
+        old_chunk_ids
+    };
+
+    for chunk_id in old_chunk_ids {
+        let path = state
+            .data_dir
+            .join("chunks")
+            .join(format!("{chunk_id}.json"));
+        if let Err(error) = fs::remove_file(&path)
+            && error.kind() != std::io::ErrorKind::NotFound
+        {
+            return Err(AppError::internal("failed to remove old chunk metadata"));
+        }
+    }
+
+    for chunk in chunks {
+        persist_chunk(&state.data_dir, chunk)?;
+    }
+
+    Ok(())
+}
+
+#[derive(Debug, Deserialize)]
+struct GeminiChunks {
+    chunks: Vec<GeminiChunk>,
+}
+
+#[derive(Debug, Deserialize)]
+struct GeminiChunk {
+    title: String,
+    page_start: u32,
+    page_end: u32,
+    source_text: String,
+    key_points: Vec<String>,
+    summary_text: String,
+    dialogue_script: String,
+    qa_context: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct GeminiGenerateContentResponse {
+    candidates: Vec<GeminiCandidate>,
+}
+
+#[derive(Debug, Deserialize)]
+struct GeminiCandidate {
+    content: GeminiContent,
+}
+
+#[derive(Debug, Deserialize)]
+struct GeminiContent {
+    parts: Vec<GeminiPart>,
+}
+
+#[derive(Debug, Deserialize)]
+struct GeminiPart {
+    text: Option<String>,
+}
+
+fn parse_gemini_chunks(raw: &str) -> Result<GeminiChunks, AppError> {
+    let json = extract_json_object(raw)?;
+    serde_json::from_str::<GeminiChunks>(&json)
+        .map_err(|_| AppError::internal("failed to parse Gemini chunk JSON"))
+}
+
+fn extract_json_object(raw: &str) -> Result<String, AppError> {
+    let trimmed = raw.trim();
+    if trimmed.starts_with('{') && trimmed.ends_with('}') {
+        return Ok(trimmed.to_string());
+    }
+
+    let fenced = trimmed
+        .strip_prefix("```json")
+        .or_else(|| trimmed.strip_prefix("```"))
+        .and_then(|value| value.strip_suffix("```"))
+        .map(str::trim);
+
+    if let Some(fenced) = fenced
+        && fenced.starts_with('{')
+        && fenced.ends_with('}')
+    {
+        return Ok(fenced.to_string());
+    }
+
+    let start = trimmed
+        .find('{')
+        .ok_or_else(|| AppError::internal("Gemini output did not include JSON"))?;
+    let end = trimmed
+        .rfind('}')
+        .ok_or_else(|| AppError::internal("Gemini output did not include JSON"))?;
+
+    Ok(trimmed[start..=end].to_string())
+}
+
+async fn generate_chunks_with_gemini(
+    http_client: &Client,
+    config: &GeminiConfig,
+    document: &Document,
+    pdf_path: &FsPath,
+) -> Result<(Vec<BookChunk>, String), AppError> {
+    let pdf_bytes = tokio::fs::read(pdf_path)
+        .await
+        .map_err(|_| AppError::internal("failed to read stored PDF"))?;
+    let pdf_base64 = general_purpose::STANDARD.encode(pdf_bytes);
+    let prompt = build_gemini_processing_prompt(document);
+    let mut last_error = None;
+    let mut response = None;
+    let mut used_model = None;
+
+    for model in &config.fallback_models {
+        match call_gemini_generate_content(
+            http_client,
+            &config.api_key,
+            model,
+            &pdf_base64,
+            &prompt,
+        )
+        .await
+        {
+            Ok(value) => {
+                response = Some(value);
+                used_model = Some(model.clone());
+                break;
+            }
+            Err(error) => {
+                last_error = Some(error);
+            }
+        }
+    }
+
+    let response = response.ok_or_else(|| {
+        last_error.unwrap_or_else(|| AppError::internal("Gemini API did not return a response"))
+    })?;
+    let used_model =
+        used_model.ok_or_else(|| AppError::internal("Gemini model selection failed"))?;
+    let text = response
+        .candidates
+        .first()
+        .and_then(|candidate| {
+            candidate
+                .content
+                .parts
+                .iter()
+                .find_map(|part| part.text.as_deref())
+        })
+        .ok_or_else(|| AppError::internal("Gemini response did not include text"))?;
+    let parsed = parse_gemini_chunks(text)?;
+
+    let mut chunks = parsed
+        .chunks
+        .into_iter()
+        .map(|chunk| BookChunk {
+            id: Uuid::new_v4().to_string(),
+            document_id: document.id.clone(),
+            title: chunk.title,
+            page_start: chunk.page_start,
+            page_end: chunk.page_end,
+            source_text: chunk.source_text,
+            key_points: chunk.key_points,
+            summary_text: chunk.summary_text,
+            dialogue_script: chunk.dialogue_script,
+            qa_context: chunk.qa_context,
+            audio_path: None,
+        })
+        .collect::<Vec<_>>();
+
+    chunks.sort_by(|a, b| {
+        a.page_start
+            .cmp(&b.page_start)
+            .then_with(|| a.page_end.cmp(&b.page_end))
+    });
+
+    Ok((chunks, used_model))
+}
+
+async fn call_gemini_generate_content(
+    http_client: &Client,
+    api_key: &str,
+    model: &str,
+    pdf_base64: &str,
+    prompt: &str,
+) -> Result<GeminiGenerateContentResponse, AppError> {
+    let url =
+        format!("https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent");
+    let body = serde_json::json!({
+        "contents": [{
+            "parts": [
+                {
+                    "inline_data": {
+                        "mime_type": "application/pdf",
+                        "data": pdf_base64
+                    }
+                },
+                {
+                    "text": prompt
+                }
+            ]
+        }],
+        "generation_config": {
+            "response_mime_type": "application/json"
+        }
+    });
+
+    let response = http_client
+        .post(url)
+        .header("x-goog-api-key", api_key)
+        .json(&body)
+        .send()
+        .await
+        .map_err(|_| AppError::internal(format!("failed to call Gemini API model {model}")))?;
+    let status = response.status();
+    let body = response
+        .text()
+        .await
+        .map_err(|_| AppError::internal("failed to read Gemini API response"))?;
+
+    if !status.is_success() {
+        return Err(AppError::internal(format!(
+            "Gemini API model {model} failed with status {status}: {}",
+            preview_text(&body, 600)
+        )));
+    }
+
+    serde_json::from_str::<GeminiGenerateContentResponse>(&body)
+        .map_err(|_| AppError::internal("failed to parse Gemini API response"))
+}
+
+fn build_gemini_processing_prompt(document: &Document) -> String {
+    format!(
+        "あなたは技術書PDFを、学習用の音声解説アプリ向けに構造化するアシスタントです。\n\
+PDFの本文、見出し階層、コード、表、図、キャプション、数式、ページ内レイアウトを確認し、章または節に近いまとまりでchunkを作ってください。\n\
+Return only valid JSON with this exact schema:\n\
+{{\"chunks\":[{{\"title\":\"...\",\"page_start\":5,\"page_end\":8,\"source_text\":\"...\",\"key_points\":[\"...\"],\"summary_text\":\"...\",\"dialogue_script\":\"...\",\"qa_context\":\"...\"}}]}}\n\
+\n\
+Rules:\n\
+- すべて日本語で書く。\n\
+- 先頭の表紙、目次、権利表示、前付けだけのページは原則として除外する。本文が始まるページからchunk化する。\n\
+- chunkは章/節/見出し単位を優先する。細かすぎる分割は避ける。\n\
+- page_start/page_endはPDFビューア上のページ番号に対応する整数にする。\n\
+- source_textは全文転記ではなく、後続Q&Aで根拠として使える構造化メモにする。重要な定義、コード識別子、数式、表や図の要点を含める。\n\
+- key_pointsは3から6個。PDFに根拠がある具体点だけにする。\n\
+- summary_textは4から8文。何を教える範囲か、なぜ重要か、何を覚えるべきかを説明する。\n\
+- dialogue_scriptはVOICEVOXで読み上げる単独話者の自然な日本語原稿にする。箇条書き、Markdown、役名、演出指示は使わない。\n\
+- qa_contextはQ&A用の事実メモにする。PDFにない推測は入れない。\n\
+- 図表が重要なら、見た目から読み取れる関係や傾向もsource_textとqa_contextに含める。\n\
+- JSON以外の説明やMarkdown fenceは出力しない。\n\
+\n\
+Document title: {title}\n\
+Original file name: {file_name}\n\
+Total pages: {total_pages}",
+        title = document.title,
+        file_name = document.file_name,
+        total_pages = document.total_pages
+    )
+}
+
 async fn generate_chunk_content_with_fallback(
     state: &AppState,
     chunk: BookChunk,
@@ -463,7 +823,10 @@ fn fallback_generated_content(chunk: &BookChunk) -> GeneratedChunkContent {
     GeneratedChunkContent {
         title: chunk.title.clone(),
         key_points: vec![
-            format!("{}ページから{}ページの本文を読み取りました。", chunk.page_start, chunk.page_end),
+            format!(
+                "{}ページから{}ページの本文を読み取りました。",
+                chunk.page_start, chunk.page_end
+            ),
             "Claude 生成が使えないため、抽出テキストをもとに暫定の説明を作っています。".to_string(),
             "見出しと本文を確認してから、必要に応じて再生成してください。".to_string(),
         ],
@@ -673,7 +1036,11 @@ fn is_page_artifact(line: &str) -> bool {
     }
 
     let compact = line.replace(' ', "");
-    if !compact.is_empty() && compact.chars().all(|ch| matches!(ch, 'i' | 'v' | 'x' | 'I' | 'V' | 'X')) {
+    if !compact.is_empty()
+        && compact
+            .chars()
+            .all(|ch| matches!(ch, 'i' | 'v' | 'x' | 'I' | 'V' | 'X'))
+    {
         return true;
     }
 
@@ -800,9 +1167,7 @@ fn build_chunk_from_pages(
         ],
         summary_text: format!(
             "{}ページから{}ページの暫定プレビューです。{}",
-            first_page.page_number,
-            last_page.page_number,
-            preview
+            first_page.page_number, last_page.page_number, preview
         ),
         dialogue_script: format!(
             "今回は {} を見ます。まだ整理前なので、まずは本文の冒頭を確認します。{}",
@@ -971,5 +1336,54 @@ impl IntoResponse for AppError {
             })),
         )
             .into_response()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_gemini_chunk_json_from_fenced_response() {
+        let raw = r#"
+```json
+{
+  "chunks": [
+    {
+      "title": "第1章 導入",
+      "page_start": 5,
+      "page_end": 8,
+      "source_text": "この章では設計の前提を説明する。",
+      "key_points": ["前提を整理する", "後続章の読み方を示す"],
+      "summary_text": "この範囲は導入です。",
+      "dialogue_script": "今回は導入を確認します。",
+      "qa_context": "設計の前提と後続章の読み方を扱う。"
+    }
+  ]
+}
+```
+"#;
+
+        let parsed = parse_gemini_chunks(raw).expect("Gemini JSON should parse");
+
+        assert_eq!(parsed.chunks.len(), 1);
+        assert_eq!(parsed.chunks[0].title, "第1章 導入");
+        assert_eq!(parsed.chunks[0].page_start, 5);
+        assert_eq!(parsed.chunks[0].key_points.len(), 2);
+    }
+
+    #[test]
+    fn builds_unique_gemini_model_fallbacks_from_primary_model() {
+        let models = gemini_model_candidates("gemini-2.5-flash");
+
+        assert_eq!(models[0], "gemini-2.5-flash");
+        assert!(models.contains(&"gemini-2.5-flash-lite".to_string()));
+        assert_eq!(
+            models
+                .iter()
+                .filter(|model| *model == "gemini-2.5-flash")
+                .count(),
+            1
+        );
     }
 }

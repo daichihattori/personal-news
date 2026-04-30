@@ -44,6 +44,7 @@ flowchart TD
 - フロントエンド: `Vue`
 - バックエンド: `Rust + axum`
 - LLM: `Claude Code CLI` を `LlmClient` 経由で呼ぶ
+- 高精度 PDF 解析: `Gemini API` に PDF を native input として渡す
 - 音声合成: `VOICEVOX`
 - 初期保存: ローカルファイル
 - 将来インフラ: `AWS + Terraform`
@@ -106,6 +107,17 @@ pub struct BookChunk {
 
 - ドキュメントに属する全 chunk を Claude で一括生成
 
+### `POST /api/documents/:id/process-gemini`
+
+- 保存済み PDF を Gemini API に渡す
+- PDF のテキスト、図表、レイアウトをもとに chunk を作り直す
+- 既存の chunk は差し替える
+- `GEMINI_API_KEY` が必要
+- モデルは `GEMINI_MODEL` で変更可能
+  - 未指定時は `gemini-2.5-flash`
+- fallback モデルは `GEMINI_FALLBACK_MODELS` で変更可能
+  - 未指定時は `gemini-2.5-flash-lite,gemini-2.5-pro`
+
 ### `GET /api/documents/:id/chunks`
 
 - ドキュメントに属する chunk 一覧取得
@@ -135,6 +147,7 @@ pub struct BookChunk {
 ## ローカル開発の進め方
 
 1. `claude` CLI にログインする
+1. Gemini API key を使う場合は `GEMINI_API_KEY` を設定する
 2. `backend/` の axum API を起動する
 3. `VOICEVOX` Engine を起動する
 4. `frontend/` の Vue UI を起動する
@@ -144,6 +157,16 @@ pub struct BookChunk {
 ## 現在のローカルワークフロー
 
 ```bash
+cd backend
+cargo run
+```
+
+Gemini PDF native 処理を使う場合:
+
+```bash
+export GEMINI_API_KEY="..."
+export GEMINI_MODEL=gemini-2.5-flash
+export GEMINI_FALLBACK_MODELS=gemini-2.5-flash-lite,gemini-2.5-pro
 cd backend
 cargo run
 ```
@@ -172,6 +195,7 @@ VITE_API_BASE_URL=http://127.0.0.1:3000 npm run dev
 
 - PDF アップロード
 - document / chunk 選択
+- Gemini PDF native 解析による chunk 作り直し
 - Claude 生成
 - VOICEVOX 音声生成
 - 音声再生
@@ -194,6 +218,12 @@ curl -X POST http://127.0.0.1:3000/api/chunks/<chunk_id>/generate
 
 ```bash
 curl -X POST http://127.0.0.1:3000/api/documents/<document_id>/generate
+```
+
+Gemini で PDF から chunk を作り直す:
+
+```bash
+curl -X POST http://127.0.0.1:3000/api/documents/<document_id>/process-gemini
 ```
 
 音声を生成:
