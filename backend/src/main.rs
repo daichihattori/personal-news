@@ -1,3 +1,5 @@
+mod auth;
+mod db;
 mod models;
 
 use std::{
@@ -16,24 +18,20 @@ use axum::{
     extract::{Path, Query, State},
     http::StatusCode,
     response::IntoResponse,
-    routing::{delete, get, post},
+    routing::{delete, get, post, put},
 };
 use base64::{Engine as _, engine::general_purpose};
 use chrono::Utc;
 use models::{
-    BookChunk, ChunkListItem, CreatedDocumentResponse, Document, GenerateAudioResponse,
-    GenerateDocumentResponse,
+    ApiKeyInfo, BookChunk, ChunkListItem, CreatedDocumentResponse, Document, GenerateAudioResponse,
+    GenerateDocumentResponse, User,
 };
 use reqwest::Client;
 use serde::Deserialize;
-use tower_http::services::ServeDir;
+use sqlx::SqlitePool;
 use tower_http::{cors::CorsLayer, trace::TraceLayer};
 use tracing::info;
 use uuid::Uuid;
-
-const MIN_SCAN_START_PAGE: u32 = 5;
-const MIN_CHUNK_PAGES: usize = 2;
-const MAX_CHUNK_PAGES: usize = 4;
 
 #[derive(Clone)]
 struct AppState {
@@ -42,6 +40,9 @@ struct AppState {
     http_client: Client,
     voicevox_base_url: String,
     gemini_config: Option<GeminiConfig>,
+    db: SqlitePool,
+    app_env: String,
+    dev_user_id: String,
 }
 
 #[derive(Clone)]
@@ -64,25 +65,55 @@ async fn main() {
         .with_env_filter("personal_news_backend=debug,tower_http=debug")
         .init();
 
-    let data_dir = init_data_dirs();
+    let app_env = env::var("APP_ENV").unwrap_or_else(|_| "local".to_string());
+    let dev_user_id =
+        env::var("DEV_USER_ID").unwrap_or_else(|_| "local-user".to_string());
+
+    // Ensure data directory exists before connecting to SQLite
+    fs::create_dir_all("../data").expect("failed to create data directory");
+
+    let db_path = env::var("DATABASE_PATH")
+        .unwrap_or_else(|_| "../data/db.sqlite".to_string());
+    let db = sqlx::sqlite::SqlitePoolOptions::new()
+        .connect_with(
+            sqlx::sqlite::SqliteConnectOptions::new()
+                .filename(&db_path)
+                .create_if_missing(true),
+        )
+        .await
+        .expect("failed to connect to database");
+    sqlx::migrate!("./migrations")
+        .run(&db)
+        .await
+        .expect("failed to run database migrations");
+
+    let data_dir = init_data_dirs(&dev_user_id);
+    migrate_legacy_data(&data_dir, &dev_user_id);
+
     let state = AppState {
-        store: Arc::new(RwLock::new(load_store(&data_dir))),
-        data_dir,
+        store: Arc::new(RwLock::new(load_store(&data_dir, &dev_user_id))),
+        data_dir: data_dir.clone(),
         http_client: Client::new(),
         voicevox_base_url: env::var("VOICEVOX_BASE_URL")
             .unwrap_or_else(|_| "http://127.0.0.1:50021".to_string()),
         gemini_config: build_gemini_config(),
+        db,
+        app_env,
+        dev_user_id,
     };
 
     let app = Router::new()
         .route("/api/health", get(health))
+        .route("/api/me", get(get_me))
+        .route("/api/me/api-keys", get(list_api_keys))
+        .route("/api/me/api-keys/{provider}", put(put_api_key).delete(delete_api_key_handler))
         .route("/api/documents", get(list_documents).post(create_document))
         .route("/api/documents/{id}", delete(delete_document))
         .route("/api/documents/{id}/generate", post(generate_document))
         .route("/api/documents/{id}/chunks", get(list_document_chunks))
         .route("/api/chunks/{id}", get(get_chunk))
         .route("/api/chunks/{id}/audio", post(generate_audio))
-        .nest_service("/audio", ServeDir::new(state.data_dir.join("audio")))
+        .route("/audio/{user_id}/{chunk_id}", get(serve_audio))
         .layer(DefaultBodyLimit::max(32 * 1024 * 1024))
         .with_state(state)
         .layer(CorsLayer::permissive())
@@ -107,35 +138,141 @@ async fn health() -> impl IntoResponse {
     }))
 }
 
-async fn list_documents(State(state): State<AppState>) -> Result<Json<Vec<Document>>, AppError> {
+async fn get_me(
+    auth: auth::AuthUser,
+    State(_state): State<AppState>,
+) -> impl IntoResponse {
+    Json(User {
+        id: auth.user_id,
+        email: auth.email,
+        display_name: auth.display_name,
+    })
+}
+
+async fn list_api_keys(
+    auth: auth::AuthUser,
+    State(state): State<AppState>,
+) -> Result<impl IntoResponse, AppError> {
+    let mut keys = db::list_api_keys(&state.db, &auth.user_id)
+        .await
+        .map_err(|_| AppError::internal("failed to list api keys"))?;
+
+    // If .env fallback is active and no stored key, show it as a hint
+    if state.app_env == "local" {
+        if !keys.iter().any(|k| k.provider == "gemini") {
+            if let Some(ref cfg) = state.gemini_config {
+                let hint = cfg.api_key.chars().rev().take(4).collect::<String>()
+                    .chars().rev().collect::<String>();
+                keys.push(ApiKeyInfo {
+                    provider: "gemini".to_string(),
+                    configured: true,
+                    key_hint: format!("…{hint} (.env)"),
+                });
+            }
+        }
+    }
+
+    Ok(Json(keys))
+}
+
+#[derive(Deserialize)]
+struct PutApiKeyBody {
+    api_key: String,
+}
+
+async fn put_api_key(
+    auth: auth::AuthUser,
+    Path(provider): Path<String>,
+    State(state): State<AppState>,
+    Json(body): Json<PutApiKeyBody>,
+) -> Result<StatusCode, AppError> {
+    let key_hint = {
+        let last4: String = body.api_key.chars().rev().take(4).collect::<String>()
+            .chars().rev().collect();
+        format!("…{last4}")
+    };
+
+    db::save_api_key(&state.db, &auth.user_id, &provider, &body.api_key, &key_hint)
+        .await
+        .map_err(|_| AppError::internal("failed to save api key"))?;
+
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn delete_api_key_handler(
+    auth: auth::AuthUser,
+    Path(provider): Path<String>,
+    State(state): State<AppState>,
+) -> Result<StatusCode, AppError> {
+    let deleted = db::delete_api_key(&state.db, &auth.user_id, &provider)
+        .await
+        .map_err(|_| AppError::internal("failed to delete api key"))?;
+
+    if deleted {
+        Ok(StatusCode::NO_CONTENT)
+    } else {
+        Err(AppError::not_found("api key not found"))
+    }
+}
+
+async fn serve_audio(
+    Path((uid, chunk_id)): Path<(String, String)>,
+    State(state): State<AppState>,
+) -> impl IntoResponse {
+    let path = state.data_dir.join("users").join(&uid).join("audio").join(&chunk_id);
+    match tokio::fs::read(&path).await {
+        Ok(bytes) => (
+            StatusCode::OK,
+            [("content-type", "audio/wav"), ("cache-control", "public, max-age=86400")],
+            bytes,
+        ).into_response(),
+        Err(_) => StatusCode::NOT_FOUND.into_response(),
+    }
+}
+
+async fn list_documents(
+    auth: auth::AuthUser,
+    State(state): State<AppState>,
+) -> Result<Json<Vec<Document>>, AppError> {
     let store = state
         .store
         .read()
         .map_err(|_| AppError::internal("failed to read document store"))?;
 
-    let mut documents: Vec<_> = store.documents.values().cloned().collect();
+    let mut documents: Vec<_> = store
+        .documents
+        .values()
+        .filter(|d| d.user_id == auth.user_id)
+        .cloned()
+        .collect();
     documents.sort_by(|a, b| b.created_at.cmp(&a.created_at));
     Ok(Json(documents))
 }
 
 async fn delete_document(
+    auth: auth::AuthUser,
     Path(id): Path<String>,
     State(state): State<AppState>,
 ) -> Result<StatusCode, AppError> {
-    let chunk_ids_and_audio: Vec<(String, Option<String>)> = {
+    let (owner_user_id, chunk_ids_and_audio): (String, Vec<(String, Option<String>)>) = {
         let store = state
             .store
             .read()
             .map_err(|_| AppError::internal("failed to read store"))?;
-        if !store.documents.contains_key(&id) {
+        let doc = store
+            .documents
+            .get(&id)
+            .ok_or_else(|| AppError::not_found("document not found"))?;
+        if doc.user_id != auth.user_id {
             return Err(AppError::not_found("document not found"));
         }
-        store
+        let chunks = store
             .chunks
             .values()
             .filter(|c| c.document_id == id)
             .map(|c| (c.id.clone(), c.audio_path.clone()))
-            .collect()
+            .collect();
+        (doc.user_id.clone(), chunks)
     };
 
     {
@@ -149,19 +286,16 @@ async fn delete_document(
         }
     }
 
-    let _ = fs::remove_file(state.data_dir.join("documents").join(format!("{id}.json")));
-    let _ = fs::remove_file(state.data_dir.join("documents").join(format!("{id}.pdf")));
+    let udir = user_dir(&state.data_dir, &owner_user_id);
+    let _ = fs::remove_file(udir.join("documents").join(format!("{id}.json")));
+    let _ = fs::remove_file(udir.join("documents").join(format!("{id}.pdf")));
 
     for (chunk_id, audio_path) in chunk_ids_and_audio {
-        let _ = fs::remove_file(
-            state
-                .data_dir
-                .join("chunks")
-                .join(format!("{chunk_id}.json")),
-        );
+        let _ = fs::remove_file(udir.join("chunks").join(format!("{chunk_id}.json")));
         if let Some(path) = audio_path {
+            // path is like /audio/{user_id}/{chunk_id}.wav — extract filename
             if let Some(file_name) = FsPath::new(&path).file_name() {
-                let _ = fs::remove_file(state.data_dir.join("audio").join(file_name));
+                let _ = fs::remove_file(udir.join("audio").join(file_name));
             }
         }
     }
@@ -170,6 +304,7 @@ async fn delete_document(
 }
 
 async fn create_document(
+    auth: auth::AuthUser,
     State(state): State<AppState>,
     mut multipart: Multipart,
 ) -> Result<Json<CreatedDocumentResponse>, AppError> {
@@ -203,8 +338,9 @@ async fn create_document(
     }
 
     let document_id = Uuid::new_v4().to_string();
-    let stored_file_name = format!("{document_id}.pdf");
-    let pdf_path = state.data_dir.join("documents").join(stored_file_name);
+    let doc_dir = user_dir(&state.data_dir, &auth.user_id).join("documents");
+    fs::create_dir_all(&doc_dir).map_err(|_| AppError::internal("failed to create document dir"))?;
+    let pdf_path = doc_dir.join(format!("{document_id}.pdf"));
 
     tokio::fs::write(&pdf_path, file_bytes)
         .await
@@ -213,13 +349,14 @@ async fn create_document(
     let page_count = extract_page_count(&pdf_path).await?;
     let document = Document {
         id: document_id.clone(),
+        user_id: auth.user_id.clone(),
         title: file_stem_or_name(&file_name),
         file_name,
         total_pages: page_count,
         created_at: Utc::now(),
     };
 
-    let chunks = build_chunks(&document, &pdf_path).await?;
+    let chunks = initial_chunks_for_upload();
 
     {
         let mut store = state
@@ -236,7 +373,7 @@ async fn create_document(
 
     persist_document(&state.data_dir, &document)?;
     for chunk in &chunks {
-        persist_chunk(&state.data_dir, chunk)?;
+        persist_chunk(&state.data_dir, chunk, &document.user_id)?;
     }
 
     let response = CreatedDocumentResponse {
@@ -248,6 +385,7 @@ async fn create_document(
 }
 
 async fn list_document_chunks(
+    auth: auth::AuthUser,
     Path(id): Path<String>,
     State(state): State<AppState>,
 ) -> Result<Json<Vec<ChunkListItem>>, AppError> {
@@ -256,7 +394,11 @@ async fn list_document_chunks(
         .read()
         .map_err(|_| AppError::internal("failed to read chunk store"))?;
 
-    if !store.documents.contains_key(&id) {
+    let doc = store
+        .documents
+        .get(&id)
+        .ok_or_else(|| AppError::not_found("document not found"))?;
+    if doc.user_id != auth.user_id {
         return Err(AppError::not_found("document not found"));
     }
 
@@ -277,6 +419,7 @@ async fn list_document_chunks(
 }
 
 async fn get_chunk(
+    auth: auth::AuthUser,
     Path(id): Path<String>,
     State(state): State<AppState>,
 ) -> Result<Json<BookChunk>, AppError> {
@@ -291,6 +434,12 @@ async fn get_chunk(
         .cloned()
         .ok_or_else(|| AppError::not_found("chunk not found"))?;
 
+    // ownership check via parent document
+    let doc = store.documents.get(&chunk.document_id);
+    if doc.map(|d| d.user_id.as_str()) != Some(auth.user_id.as_str()) {
+        return Err(AppError::not_found("chunk not found"));
+    }
+
     Ok(Json(chunk))
 }
 
@@ -300,6 +449,7 @@ struct GenerateQuery {
 }
 
 async fn generate_document(
+    auth: auth::AuthUser,
     Path(id): Path<String>,
     Query(query): Query<GenerateQuery>,
     State(state): State<AppState>,
@@ -309,28 +459,29 @@ async fn generate_document(
             .store
             .read()
             .map_err(|_| AppError::internal("failed to read document store"))?;
-        store
+        let doc = store
             .documents
             .get(&id)
             .cloned()
-            .ok_or_else(|| AppError::not_found("document not found"))?
+            .ok_or_else(|| AppError::not_found("document not found"))?;
+        if doc.user_id != auth.user_id {
+            return Err(AppError::not_found("document not found"));
+        }
+        doc
     };
 
-    let mut config = state
-        .gemini_config
-        .clone()
-        .ok_or_else(|| AppError::bad_request("GEMINI_API_KEY is not configured"))?;
+    // Resolve Gemini API key: user key > .env fallback (local only)
+    let mut config = resolve_gemini_config(&state, &auth.user_id).await?;
     if let Some(model) = query.model {
         config.fallback_models = vec![normalize_gemini_model(&model).to_string()];
     }
-    let pdf_path = state
-        .data_dir
+    let pdf_path = user_dir(&state.data_dir, &document.user_id)
         .join("documents")
         .join(format!("{}.pdf", document.id));
     let (chunks, model) =
         generate_chunks_with_gemini(&state.http_client, &config, &document, &pdf_path).await?;
 
-    replace_document_chunks(&state, &document.id, &chunks)?;
+    replace_document_chunks(&state, &document.id, &document.user_id, &chunks)?;
 
     Ok(Json(GenerateDocumentResponse {
         document,
@@ -340,6 +491,7 @@ async fn generate_document(
 }
 
 async fn generate_audio(
+    auth: auth::AuthUser,
     Path(id): Path<String>,
     State(state): State<AppState>,
 ) -> Result<Json<GenerateAudioResponse>, AppError> {
@@ -348,13 +500,18 @@ async fn generate_audio(
             .store
             .read()
             .map_err(|_| AppError::internal("failed to read chunk store"))?;
-        store
+        let chunk = store
             .chunks
             .get(id.as_str())
             .cloned()
-            .ok_or_else(|| AppError::not_found("chunk not found"))?
+            .ok_or_else(|| AppError::not_found("chunk not found"))?;
+        let doc = store.documents.get(&chunk.document_id);
+        if doc.map(|d| d.user_id.as_str()) != Some(auth.user_id.as_str()) {
+            return Err(AppError::not_found("chunk not found"));
+        }
+        chunk
     };
-    let updated_chunk = synthesize_chunk_audio(&state, chunk).await?;
+    let updated_chunk = synthesize_chunk_audio(&state, chunk, &auth.user_id).await?;
     let audio_url = updated_chunk
         .audio_path
         .clone()
@@ -366,12 +523,32 @@ async fn generate_audio(
     }))
 }
 
-fn init_data_dirs() -> PathBuf {
+fn init_data_dirs(dev_user_id: &str) -> PathBuf {
     let data_dir = PathBuf::from("../data");
+    let user_dir = data_dir.join("users").join(dev_user_id);
     for name in ["documents", "chunks", "audio"] {
-        fs::create_dir_all(data_dir.join(name)).expect("failed to create data directories");
+        fs::create_dir_all(user_dir.join(name)).expect("failed to create data directories");
     }
     data_dir
+}
+
+fn migrate_legacy_data(data_dir: &FsPath, dev_user_id: &str) {
+    let user_dir = data_dir.join("users").join(dev_user_id);
+    for name in ["documents", "chunks", "audio"] {
+        let old_dir = data_dir.join(name);
+        let new_dir = user_dir.join(name);
+        let Ok(entries) = fs::read_dir(&old_dir) else { continue };
+        for entry in entries.flatten() {
+            let old_path = entry.path();
+            let Some(file_name) = old_path.file_name() else { continue };
+            let new_path = new_dir.join(file_name);
+            if !new_path.exists() {
+                if let Err(e) = fs::rename(&old_path, &new_path) {
+                    tracing::warn!("failed to migrate {}: {e}", old_path.display());
+                }
+            }
+        }
+    }
 }
 
 fn build_gemini_config() -> Option<GeminiConfig> {
@@ -382,6 +559,10 @@ fn build_gemini_config() -> Option<GeminiConfig> {
             api_key,
         }
     })
+}
+
+fn initial_chunks_for_upload() -> Vec<BookChunk> {
+    Vec::new()
 }
 
 fn gemini_model_candidates(primary_model: &str) -> Vec<String> {
@@ -411,40 +592,43 @@ fn normalize_gemini_model(model: &str) -> &str {
     }
 }
 
-fn load_store(data_dir: &FsPath) -> Store {
+fn load_store(data_dir: &FsPath, dev_user_id: &str) -> Store {
     let mut documents = HashMap::new();
     let mut chunks = HashMap::new();
 
-    let documents_dir = data_dir.join("documents");
+    let user_dir = data_dir.join("users").join(dev_user_id);
+
+    let documents_dir = user_dir.join("documents");
     if let Ok(entries) = fs::read_dir(&documents_dir) {
         for entry in entries.flatten() {
             let path = entry.path();
             if path.extension().and_then(|ext| ext.to_str()) != Some("json") {
                 continue;
             }
-
             match fs::read_to_string(&path)
                 .ok()
                 .and_then(|contents| serde_json::from_str::<Document>(&contents).ok())
             {
-                Some(document) => {
+                Some(mut document) => {
+                    if document.user_id.is_empty() {
+                        document.user_id = dev_user_id.to_string();
+                    }
                     documents.insert(document.id.clone(), document);
                 }
                 None => {
-                    tracing::warn!("failed to load document metadata from {}", path.display());
+                    tracing::warn!("failed to load document from {}", path.display());
                 }
             }
         }
     }
 
-    let chunks_dir = data_dir.join("chunks");
+    let chunks_dir = user_dir.join("chunks");
     if let Ok(entries) = fs::read_dir(&chunks_dir) {
         for entry in entries.flatten() {
             let path = entry.path();
             if path.extension().and_then(|ext| ext.to_str()) != Some("json") {
                 continue;
             }
-
             match fs::read_to_string(&path)
                 .ok()
                 .and_then(|contents| serde_json::from_str::<BookChunk>(&contents).ok())
@@ -453,7 +637,7 @@ fn load_store(data_dir: &FsPath) -> Store {
                     chunks.insert(chunk.id.clone(), chunk);
                 }
                 None => {
-                    tracing::warn!("failed to load chunk metadata from {}", path.display());
+                    tracing::warn!("failed to load chunk from {}", path.display());
                 }
             }
         }
@@ -462,25 +646,32 @@ fn load_store(data_dir: &FsPath) -> Store {
     Store { documents, chunks }
 }
 
-fn persist_document(data_dir: &FsPath, document: &Document) -> Result<(), AppError> {
-    let path = data_dir
-        .join("documents")
-        .join(format!("{}.json", document.id));
-    let json = serde_json::to_string_pretty(document)
-        .map_err(|_| AppError::internal("failed to serialize document metadata"))?;
-    fs::write(path, json).map_err(|_| AppError::internal("failed to persist document metadata"))
+fn user_dir(data_dir: &FsPath, user_id: &str) -> PathBuf {
+    data_dir.join("users").join(user_id)
 }
 
-fn persist_chunk(data_dir: &FsPath, chunk: &BookChunk) -> Result<(), AppError> {
-    let path = data_dir.join("chunks").join(format!("{}.json", chunk.id));
+fn persist_document(data_dir: &FsPath, document: &Document) -> Result<(), AppError> {
+    let dir = user_dir(data_dir, &document.user_id).join("documents");
+    fs::create_dir_all(&dir).map_err(|_| AppError::internal("failed to create document dir"))?;
+    let json = serde_json::to_string_pretty(document)
+        .map_err(|_| AppError::internal("failed to serialize document metadata"))?;
+    fs::write(dir.join(format!("{}.json", document.id)), json)
+        .map_err(|_| AppError::internal("failed to persist document metadata"))
+}
+
+fn persist_chunk(data_dir: &FsPath, chunk: &BookChunk, user_id: &str) -> Result<(), AppError> {
+    let dir = user_dir(data_dir, user_id).join("chunks");
+    fs::create_dir_all(&dir).map_err(|_| AppError::internal("failed to create chunk dir"))?;
     let json = serde_json::to_string_pretty(chunk)
         .map_err(|_| AppError::internal("failed to serialize chunk metadata"))?;
-    fs::write(path, json).map_err(|_| AppError::internal("failed to persist chunk metadata"))
+    fs::write(dir.join(format!("{}.json", chunk.id)), json)
+        .map_err(|_| AppError::internal("failed to persist chunk metadata"))
 }
 
 fn replace_document_chunks(
     state: &AppState,
     document_id: &str,
+    user_id: &str,
     chunks: &[BookChunk],
 ) -> Result<(), AppError> {
     let old_chunk_ids = {
@@ -498,19 +689,15 @@ fn replace_document_chunks(
         for chunk_id in &old_chunk_ids {
             store.chunks.remove(chunk_id);
         }
-
         for chunk in chunks {
             store.chunks.insert(chunk.id.clone(), chunk.clone());
         }
-
         old_chunk_ids
     };
 
+    let chunks_dir = user_dir(&state.data_dir, user_id).join("chunks");
     for chunk_id in old_chunk_ids {
-        let path = state
-            .data_dir
-            .join("chunks")
-            .join(format!("{chunk_id}.json"));
+        let path = chunks_dir.join(format!("{chunk_id}.json"));
         if let Err(error) = fs::remove_file(&path)
             && error.kind() != std::io::ErrorKind::NotFound
         {
@@ -519,10 +706,27 @@ fn replace_document_chunks(
     }
 
     for chunk in chunks {
-        persist_chunk(&state.data_dir, chunk)?;
+        persist_chunk(&state.data_dir, chunk, user_id)?;
     }
 
     Ok(())
+}
+
+async fn resolve_gemini_config(
+    state: &AppState,
+    user_id: &str,
+) -> Result<GeminiConfig, AppError> {
+    // 1. User's stored key (plaintext; production will use KMS here)
+    if let Ok(Some(api_key)) = db::get_api_key(&state.db, user_id, "gemini").await {
+        let model = env::var("GEMINI_MODEL").unwrap_or_else(|_| "gemini-2.0-flash".to_string());
+        return Ok(GeminiConfig { api_key, fallback_models: gemini_model_candidates(&model) });
+    }
+
+    // 2. .env fallback (local only)
+    state
+        .gemini_config
+        .clone()
+        .ok_or_else(|| AppError::bad_request("Gemini API key is not configured for this user"))
 }
 
 #[derive(Debug, Deserialize)]
@@ -756,11 +960,14 @@ fn build_gemini_processing_prompt(document: &Document) -> String {
         "あなたは「ずんだもんラジオ」の台本ライターです。添付されたPDFを読み込み、10〜15分のラジオ番組台本を1本生成してください。\n\
 \n\
 【出演者】\n\
-ずんだもん：元気いっぱいで好奇心旺盛。語尾に「〜なのだ」「〜のだ」を自然に混ぜる。難しい内容を「例えると」「ざっくり言うと」で噛み砕く。\n\
-四国めたん：知的でちょっとツンデレ。語尾に「〜わ」「〜かしら」「〜ね」を自然に混ぜる。ずんだもんの解説に補足やツッコミを入れる。\n\
+ずんだもん：元気いっぱいで好奇心旺盛。大学生程度の教養と理系基礎知識を持っている。語尾に「〜なのだ」「〜のだ」を自然に混ぜる。難しい内容を「例えると」「ざっくり言うと」で噛み砕く。\n\
+四国めたん：知的でちょっとツンデレ。大学生程度の教養と理系基礎知識を持っている。語尾に「〜わ」「〜かしら」「〜ね」を自然に混ぜる。ずんだもんの解説に補足やツッコミを入れる。\n\
 \n\
 【番組の雰囲気】\n\
 「この論文、何の役に立つの？」「だから何がすごいの？」を中心に掛け合いで進める。学術的な正確さよりも「聞いていて面白い」を最優先にする。例え話や身近なたとえを積極的に使う。テンポよくボケとツッコミが入る。技術的な詳細は最小限に抑え、「なぜ面白いか」「世界が変わるとしたら何が？」を優先する。\n\
+\n\
+【PDF外の補足知識】\n\
+dialogue_turnsでは、PDFの理解に必要な範囲で一般的な大学生レベルの背景知識を補ってよい。専門用語の前提、歴史的背景、似た概念、身近な例、なぜその分野で重要かを自然に説明する。ただし、PDFに書かれている主張と外部知識を混同しない。「PDFではこう言っている」「背景としてはこう考えると分かりやすい」のように区別する。PDFにない新事実を論文の主張として断定しない。\n\
 \n\
 【出力形式】\n\
 以下のJSON形式のみで返答すること。それ以外は出力しない：\n\
@@ -781,7 +988,7 @@ speakerは「zundamon」または「metan」のみ使う。ずんだもんから
 記号・絵文字・箇条書き・Markdown・数式・英数字の羅列は使わない。数式は言葉で説明する。役名・ト書き・演出指示は書かない。JSON以外の説明やMarkdown fenceは出力しない。\n\
 \n\
 【その他フィールド】\n\
-source_text：PDFの主要な内容をまとめたメモ（Q&A用）。key_points：3〜5個、このPDFの重要なポイント。summary_text：3〜5文でPDF全体の概要。qa_context：Q&A用の事実メモ（PDFにない推測は入れない）。\n\
+source_text：PDFの主要な内容をまとめたメモ（Q&A用）。key_points：3〜5個、このPDFの重要なポイント。summary_text：3〜5文でPDF全体の概要。qa_context：Q&A用の事実メモ。qa_contextにはPDF由来の事実と、理解補助の一般背景知識を分けて書く。PDFにない新事実をPDFの主張として扱わない。\n\
 \n\
 Document title: {title}\n\
 Original file name: {file_name}\n\
@@ -853,7 +1060,11 @@ fn concatenate_wavs(wavs: &[Vec<u8>], pause_ms: u32) -> Vec<u8> {
     build_wav(&pcm)
 }
 
-async fn synthesize_chunk_audio(state: &AppState, chunk: BookChunk) -> Result<BookChunk, AppError> {
+async fn synthesize_chunk_audio(
+    state: &AppState,
+    chunk: BookChunk,
+    user_id: &str,
+) -> Result<BookChunk, AppError> {
     let audio_bytes = if !chunk.dialogue_turns.is_empty() {
         let mut turn_wavs = Vec::new();
         for turn in &chunk.dialogue_turns {
@@ -886,13 +1097,14 @@ async fn synthesize_chunk_audio(state: &AppState, chunk: BookChunk) -> Result<Bo
     };
 
     let file_name = format!("{}.wav", chunk.id);
-    let audio_path = state.data_dir.join("audio").join(&file_name);
-    tokio::fs::write(&audio_path, audio_bytes)
+    let audio_dir = user_dir(&state.data_dir, user_id).join("audio");
+    fs::create_dir_all(&audio_dir).map_err(|_| AppError::internal("failed to create audio dir"))?;
+    tokio::fs::write(audio_dir.join(&file_name), audio_bytes)
         .await
         .map_err(|_| AppError::internal("failed to write synthesized audio"))?;
 
     let updated_chunk = BookChunk {
-        audio_path: Some(format!("/audio/{file_name}")),
+        audio_path: Some(format!("/audio/{user_id}/{file_name}")),
         ..chunk
     };
 
@@ -906,7 +1118,7 @@ async fn synthesize_chunk_audio(state: &AppState, chunk: BookChunk) -> Result<Bo
             .insert(updated_chunk.id.clone(), updated_chunk.clone());
     }
 
-    persist_chunk(&state.data_dir, &updated_chunk)?;
+    persist_chunk(&state.data_dir, &updated_chunk, user_id)?;
 
     Ok(updated_chunk)
 }
@@ -993,320 +1205,6 @@ async fn extract_page_count(pdf_path: &FsPath) -> Result<u32, AppError> {
     .map_err(|_| AppError::internal("pdfinfo task failed"))?
 }
 
-async fn build_chunks(document: &Document, pdf_path: &FsPath) -> Result<Vec<BookChunk>, AppError> {
-    let mut pages = Vec::new();
-    for page_number in MIN_SCAN_START_PAGE..=document.total_pages {
-        let raw_text = extract_pdf_text(pdf_path, page_number, page_number).await?;
-        let normalized = normalize_text(&raw_text);
-        if normalized.is_empty() {
-            continue;
-        }
-
-        pages.push(ExtractedPage {
-            page_number,
-            text: normalized.clone(),
-            heading: detect_heading(&normalized),
-        });
-    }
-
-    if pages.is_empty() {
-        return Ok(Vec::new());
-    }
-
-    let content_start = detect_content_start_page(&pages).unwrap_or(MIN_SCAN_START_PAGE);
-    let relevant_pages = pages
-        .into_iter()
-        .filter(|page| page.page_number >= content_start)
-        .collect::<Vec<_>>();
-
-    chunk_pages(document, &relevant_pages)
-}
-
-async fn extract_pdf_text(pdf_path: &FsPath, start: u32, end: u32) -> Result<String, AppError> {
-    let pdf_path = pdf_path.to_path_buf();
-    tokio::task::spawn_blocking(move || {
-        let output = Command::new("pdftotext")
-            .arg("-layout")
-            .arg("-f")
-            .arg(start.to_string())
-            .arg("-l")
-            .arg(end.to_string())
-            .arg(&pdf_path)
-            .arg("-")
-            .output()
-            .map_err(|_| AppError::internal("failed to run pdftotext"))?;
-
-        if !output.status.success() {
-            return Err(AppError::internal("pdftotext failed"));
-        }
-
-        let text = String::from_utf8(output.stdout)
-            .map_err(|_| AppError::internal("pdftotext output was not valid UTF-8"))?;
-
-        Ok(text)
-    })
-    .await
-    .map_err(|_| AppError::internal("pdftotext task failed"))?
-}
-
-fn normalize_text(text: &str) -> String {
-    text.lines()
-        .map(str::trim)
-        .filter(|line| !line.is_empty())
-        .filter(|line| !is_page_artifact(line))
-        .collect::<Vec<_>>()
-        .join("\n")
-}
-
-fn is_page_artifact(line: &str) -> bool {
-    if line.chars().all(|ch| ch.is_ascii_digit()) {
-        return true;
-    }
-
-    let compact = line.replace(' ', "");
-    if !compact.is_empty()
-        && compact
-            .chars()
-            .all(|ch| matches!(ch, 'i' | 'v' | 'x' | 'I' | 'V' | 'X'))
-    {
-        return true;
-    }
-
-    false
-}
-
-#[derive(Debug, Clone)]
-struct ExtractedPage {
-    page_number: u32,
-    text: String,
-    heading: Option<DetectedHeading>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum HeadingStrength {
-    Major,
-    Section,
-}
-
-#[derive(Debug, Clone)]
-struct DetectedHeading {
-    title: String,
-    strength: HeadingStrength,
-}
-
-fn detect_content_start_page(pages: &[ExtractedPage]) -> Option<u32> {
-    pages.iter().find_map(|page| {
-        page.heading.as_ref().and_then(|heading| {
-            if heading.strength == HeadingStrength::Major {
-                Some(page.page_number)
-            } else {
-                None
-            }
-        })
-    })
-}
-
-fn chunk_pages(document: &Document, pages: &[ExtractedPage]) -> Result<Vec<BookChunk>, AppError> {
-    if pages.is_empty() {
-        return Ok(Vec::new());
-    }
-
-    let mut ranges = Vec::new();
-    let mut start_index = 0usize;
-
-    for index in 1..pages.len() {
-        let current_len = index - start_index;
-        let next_has_heading = pages[index].heading.is_some();
-
-        if current_len >= MIN_CHUNK_PAGES && next_has_heading {
-            ranges.push((start_index, index));
-            start_index = index;
-            continue;
-        }
-
-        if current_len >= MAX_CHUNK_PAGES {
-            ranges.push((start_index, index));
-            start_index = index;
-        }
-    }
-
-    if let Some((last_start, last_end)) = ranges.last_mut() {
-        let trailing_len = pages.len() - start_index;
-        if trailing_len < MIN_CHUNK_PAGES && (*last_end - *last_start) < MAX_CHUNK_PAGES {
-            *last_end = pages.len();
-        } else {
-            ranges.push((start_index, pages.len()));
-        }
-    } else {
-        ranges.push((start_index, pages.len()));
-    }
-
-    let chunks = ranges
-        .into_iter()
-        .map(|(start_index, end_index)| {
-            let page_slice = &pages[start_index..end_index];
-            build_chunk_from_pages(document, page_slice)
-        })
-        .collect::<Result<Vec<_>, _>>()?;
-
-    Ok(chunks)
-}
-
-fn build_chunk_from_pages(
-    document: &Document,
-    page_slice: &[ExtractedPage],
-) -> Result<BookChunk, AppError> {
-    let first_page = page_slice
-        .first()
-        .ok_or_else(|| AppError::internal("cannot build chunk from empty page slice"))?;
-    let last_page = page_slice
-        .last()
-        .ok_or_else(|| AppError::internal("cannot build chunk from empty page slice"))?;
-
-    let source_text = page_slice
-        .iter()
-        .map(|page| format!("[Page {}]\n{}", page.page_number, page.text))
-        .collect::<Vec<_>>()
-        .join("\n\n");
-    let preview = preview_text(&source_text, 220);
-    let title = page_slice
-        .iter()
-        .find_map(|page| page.heading.as_ref().map(|heading| heading.title.clone()))
-        .unwrap_or_else(|| {
-            format!(
-                "{} {}-{}ページ",
-                document.title, first_page.page_number, last_page.page_number
-            )
-        });
-
-    Ok(BookChunk {
-        id: Uuid::new_v4().to_string(),
-        document_id: document.id.clone(),
-        title: title.clone(),
-        page_start: first_page.page_number,
-        page_end: last_page.page_number,
-        source_text: source_text.clone(),
-        key_points: vec![
-            format!(
-                "{}ページから{}ページの抽出内容です。",
-                first_page.page_number, last_page.page_number
-            ),
-            "見出し単位に近づけるため、章や節の切れ目で chunk を分けています。".to_string(),
-        ],
-        summary_text: format!(
-            "{}ページから{}ページの暫定プレビューです。{}",
-            first_page.page_number, last_page.page_number, preview
-        ),
-        dialogue_script: format!(
-            "今回は {} を見ます。まだ整理前なので、まずは本文の冒頭を確認します。{}",
-            title, preview
-        ),
-        dialogue_turns: vec![],
-        qa_context: source_text,
-        audio_path: None,
-    })
-}
-
-fn detect_heading(text: &str) -> Option<DetectedHeading> {
-    let lines = text
-        .lines()
-        .map(str::trim)
-        .filter(|line| !line.is_empty())
-        .take(12)
-        .collect::<Vec<_>>();
-
-    if lines.is_empty() {
-        return None;
-    }
-
-    for window in lines.windows(2) {
-        let first = window[0];
-        let second = window[1];
-        if is_chapter_line(first) && !looks_like_noise(second) {
-            return Some(DetectedHeading {
-                title: clean_heading_title(&format!("{} {}", first, second)),
-                strength: HeadingStrength::Major,
-            });
-        }
-    }
-
-    for line in &lines {
-        if is_numbered_section_line(line) {
-            return Some(DetectedHeading {
-                title: clean_heading_title(line),
-                strength: HeadingStrength::Section,
-            });
-        }
-
-        if is_major_heading_line(line) {
-            return Some(DetectedHeading {
-                title: clean_heading_title(line),
-                strength: HeadingStrength::Major,
-            });
-        }
-    }
-
-    None
-}
-
-fn is_chapter_line(line: &str) -> bool {
-    let compact = line.replace(' ', "");
-    compact.ends_with('章')
-        && compact[..compact.len().saturating_sub("章".len())]
-            .chars()
-            .all(|ch| ch.is_ascii_digit() || ch == '第')
-}
-
-fn is_major_heading_line(line: &str) -> bool {
-    let compact = line.replace(' ', "");
-    (compact.starts_with('第') && compact.ends_with('章'))
-        || compact.ends_with("編")
-        || compact.ends_with("部")
-}
-
-fn is_numbered_section_line(line: &str) -> bool {
-    let trimmed = line.trim();
-    let mut seen_digit = false;
-    let mut seen_dot = false;
-
-    for ch in trimmed.chars() {
-        if ch.is_ascii_digit() {
-            seen_digit = true;
-            continue;
-        }
-
-        if ch == '.' {
-            if !seen_digit {
-                return false;
-            }
-            seen_dot = true;
-            continue;
-        }
-
-        return seen_digit && seen_dot && ch.is_whitespace();
-    }
-
-    false
-}
-
-fn looks_like_noise(line: &str) -> bool {
-    let compact = line.replace(' ', "");
-    compact.is_empty() || compact.chars().all(|ch| ch.is_ascii_digit())
-}
-
-fn clean_heading_title(raw: &str) -> String {
-    let mut parts = raw.split_whitespace().collect::<Vec<_>>();
-    while parts
-        .last()
-        .map(|part| part.chars().all(|ch| ch.is_ascii_digit()))
-        .unwrap_or(false)
-    {
-        parts.pop();
-    }
-
-    parts.join(" ")
-}
-
 fn preview_text(text: &str, max_chars: usize) -> String {
     if text.is_empty() {
         return "No text could be extracted from these pages.".to_string();
@@ -1328,45 +1226,25 @@ fn file_stem_or_name(file_name: &str) -> String {
 }
 
 #[derive(Debug)]
-struct AppError {
-    status: StatusCode,
-    message: String,
+pub struct AppError {
+    pub status: StatusCode,
+    pub message: String,
 }
 
 impl AppError {
-    fn not_found(message: impl Into<String>) -> Self {
-        Self {
-            status: StatusCode::NOT_FOUND,
-            message: message.into(),
-        }
+    pub fn not_found(message: impl Into<String>) -> Self {
+        Self { status: StatusCode::NOT_FOUND, message: message.into() }
     }
 
-    fn internal(message: impl Into<String>) -> Self {
-        Self {
-            status: StatusCode::INTERNAL_SERVER_ERROR,
-            message: message.into(),
-        }
+    pub fn internal(message: impl Into<String>) -> Self {
+        Self { status: StatusCode::INTERNAL_SERVER_ERROR, message: message.into() }
     }
 
-    fn bad_request(message: impl Into<String>) -> Self {
-        Self {
-            status: StatusCode::BAD_REQUEST,
-            message: message.into(),
-        }
+    pub fn bad_request(message: impl Into<String>) -> Self {
+        Self { status: StatusCode::BAD_REQUEST, message: message.into() }
     }
 }
 
-impl IntoResponse for AppError {
-    fn into_response(self) -> axum::response::Response {
-        (
-            self.status,
-            Json(serde_json::json!({
-                "error": self.message
-            })),
-        )
-            .into_response()
-    }
-}
 
 #[cfg(test)]
 mod tests {
@@ -1422,5 +1300,10 @@ mod tests {
 
         assert_eq!(models[0], "gemini-2.5-flash-lite");
         assert!(!models.contains(&"gemini-1.5-flash".to_string()));
+    }
+
+    #[test]
+    fn upload_starts_without_local_chunks() {
+        assert!(initial_chunks_for_upload().is_empty());
     }
 }

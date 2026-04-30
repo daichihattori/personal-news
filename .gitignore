@@ -6,4 +6,7 @@ frontend/dist
 data/documents
 data/chunks
 data/audio
+data/users
+data/db.sqlite
+*.pdf
 test-obj

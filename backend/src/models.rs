@@ -1,9 +1,29 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
+fn default_user_id() -> String {
+    "local-user".to_string()
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct User {
+    pub id: String,
+    pub email: String,
+    pub display_name: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ApiKeyInfo {
+    pub provider: String,
+    pub configured: bool,
+    pub key_hint: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Document {
     pub id: String,
+    #[serde(default = "default_user_id")]
+    pub user_id: String,
     pub title: String,
     pub file_name: String,
     pub total_pages: u32,
