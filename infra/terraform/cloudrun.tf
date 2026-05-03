@@ -15,7 +15,7 @@ resource "google_cloud_run_v2_service" "voicevox" {
     }
 
     containers {
-      image = "voicevox/voicevox_engine:cpu-ubuntu20.04-latest"
+      image = "${local.registry}/voicevox:latest"
 
       ports {
         container_port = 50021

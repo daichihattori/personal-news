@@ -78,7 +78,8 @@ async fn main() {
         .connect_with(
             sqlx::sqlite::SqliteConnectOptions::new()
                 .filename(&db_path)
-                .create_if_missing(true),
+                .create_if_missing(true)
+                .journal_mode(sqlx::sqlite::SqliteJournalMode::Wal),
         )
         .await
         .expect("failed to connect to database");

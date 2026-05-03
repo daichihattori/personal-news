@@ -1,0 +1,6 @@
+project_id             = "your-gcp-project-id"
+region                 = "asia-northeast1"
+domain                 = "news.example.com"
+gemini_model           = "gemini-2.0-flash"
+gemini_fallback_models = "gemini-2.0-flash-lite"
+voicevox_min_instances = 0
