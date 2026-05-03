@@ -146,11 +146,6 @@ resource "google_cloud_run_v2_service" "frontend" {
         container_port = 8080
       }
 
-      env {
-        name  = "BACKEND_URL"
-        value = google_cloud_run_v2_service.backend.uri
-      }
-
       resources {
         limits = {
           cpu    = "1"
@@ -160,8 +155,5 @@ resource "google_cloud_run_v2_service" "frontend" {
     }
   }
 
-  depends_on = [
-    google_project_service.apis,
-    google_cloud_run_v2_service.backend,
-  ]
+  depends_on = [google_project_service.apis]
 }

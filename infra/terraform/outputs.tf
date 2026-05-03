@@ -1,5 +1,15 @@
+output "lb_ip" {
+  description = "Load balancer IP — point your DNS A record here"
+  value       = google_compute_global_address.default.address
+}
+
+output "app_url" {
+  description = "Application URL"
+  value       = "https://${var.domain}"
+}
+
 output "frontend_url" {
-  description = "Public URL for the frontend"
+  description = "Direct Cloud Run URL for the frontend (internal use)"
   value       = google_cloud_run_v2_service.frontend.uri
 }
 

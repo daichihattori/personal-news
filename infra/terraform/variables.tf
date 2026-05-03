@@ -25,6 +25,11 @@ variable "gemini_fallback_models" {
   default = "gemini-2.0-flash-lite"
 }
 
+variable "domain" {
+  type        = string
+  description = "Custom domain for the app (e.g. news.example.com). Used for managed SSL cert and URL map host rule."
+}
+
 variable "voicevox_min_instances" {
   type        = number
   default     = 0
