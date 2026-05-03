@@ -9,12 +9,6 @@ resource "google_storage_bucket_iam_member" "backend_gcs" {
   member = "serviceAccount:${google_service_account.backend.email}"
 }
 
-resource "google_secret_manager_secret_iam_member" "backend_secret" {
-  secret_id = google_secret_manager_secret.gemini_api_key.secret_id
-  role      = "roles/secretmanager.secretAccessor"
-  member    = "serviceAccount:${google_service_account.backend.email}"
-}
-
 resource "google_cloud_run_v2_service_iam_member" "voicevox_public" {
   project  = var.project_id
   location = var.region

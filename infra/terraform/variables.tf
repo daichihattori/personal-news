@@ -9,12 +9,6 @@ variable "region" {
   description = "GCP region (default: Tokyo)"
 }
 
-variable "gemini_api_key" {
-  type        = string
-  sensitive   = true
-  description = "Gemini API key (stored in Secret Manager)"
-}
-
 variable "gemini_model" {
   type    = string
   default = "gemini-2.0-flash"
