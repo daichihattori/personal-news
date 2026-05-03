@@ -10,7 +10,7 @@ const GEMINI_MODEL_OPTIONS = [
   { value: 'gemini-2.0-flash', label: 'Gemini 2.0 Flash' }
 ]
 
-const apiBase = import.meta.env.VITE_API_BASE_URL || 'http://127.0.0.1:3000'
+const apiBase = import.meta.env.VITE_API_BASE_URL || 'http://127.0.0.1:8080'
 
 const documents = ref([])
 const selectedDocumentId = ref('')
@@ -19,7 +19,6 @@ const selectedChunkId = ref('')
 const selectedChunk = ref(null)
 const statusMessage = ref('')
 const uploadInput = ref(null)
-const showTranscript = ref(false)
 const sidebarOpen = ref(true)
 const deletingId = ref('')
 const zundamonPortrait = ref('')
@@ -117,14 +116,12 @@ async function selectDocument(id) {
   selectedDocumentId.value = id
   selectedChunkId.value = ''
   selectedChunk.value = null
-  showTranscript.value = false
   await refreshChunks(id)
 }
 
 async function selectChunk(chunk) {
   if (selectedChunkId.value === chunk.id) return
   selectedChunkId.value = chunk.id
-  showTranscript.value = false
   try {
     const res = await request(`/api/chunks/${chunk.id}`)
     selectedChunk.value = await res.json()
@@ -361,16 +358,38 @@ async function generateChunkAudio(chunkId) {
               <div class="ep-body">
                 <div class="ep-title">{{ chunk.title || `セクション ${chunk.page_start}` }}</div>
                 <div class="ep-meta">p.{{ chunk.page_start }} – {{ chunk.page_end }}</div>
-                <div
-                  class="ep-summary-wrap"
-                  :class="{ open: chunk.id === selectedChunkId && selectedChunk?.summary_text }"
-                >
-                  <div class="ep-summary">{{ selectedChunk?.summary_text }}</div>
-                </div>
               </div>
               <span v-if="chunk.audio_path" class="icon badge-audio">music_note</span>
               <span v-else class="icon badge-none">radio_button_unchecked</span>
             </button>
+          </div>
+
+          <!-- Selected chunk: summary + conversation (inline) -->
+          <div v-if="selectedChunk" class="chunk-detail">
+            <div v-if="selectedChunk.summary_text" class="chunk-section">
+              <h3 class="chunk-section-label">まとめ</h3>
+              <p class="chunk-summary-text">{{ selectedChunk.summary_text }}</p>
+            </div>
+
+            <div v-if="selectedChunk.dialogue_turns?.length" class="chunk-section">
+              <h3 class="chunk-section-label">会話ログ</h3>
+              <div class="conversation">
+                <div
+                  v-for="(turn, i) in selectedChunk.dialogue_turns"
+                  :key="i"
+                  class="chat-turn"
+                  :class="turn.speaker"
+                >
+                  <span class="chat-speaker">{{ turn.speaker === 'zundamon' ? 'ずんだもん' : 'めたん' }}</span>
+                  <div class="chat-bubble">{{ turn.text }}</div>
+                </div>
+              </div>
+            </div>
+
+            <div v-else-if="selectedChunk.dialogue_script" class="chunk-section">
+              <h3 class="chunk-section-label">会話ログ</h3>
+              <p class="chunk-summary-text">{{ selectedChunk.dialogue_script }}</p>
+            </div>
           </div>
         </div>
       </template>
@@ -395,46 +414,7 @@ async function generateChunkAudio(chunkId) {
               </button>
             </div>
           </div>
-
-          <button
-            class="transcript-toggle"
-            @click="showTranscript = !showTranscript"
-            :title="showTranscript ? '閉じる' : 'テキストを表示'"
-          >
-            <span class="icon">{{ showTranscript ? 'close' : 'notes' }}</span>
-          </button>
         </div>
-
-        <Transition name="expand">
-          <div v-if="showTranscript" class="transcript-backdrop">
-            <div class="transcript-panel">
-              <div class="transcript-header">
-                <div>
-                  <span class="now-playing-label">Transcript</span>
-                  <h2>{{ selectedChunk.title }}</h2>
-                </div>
-                <button class="transcript-toggle" @click="showTranscript = false" title="閉じる">
-                  <span class="icon">close</span>
-                </button>
-              </div>
-
-              <div class="transcript">
-                <template v-if="selectedChunk.dialogue_turns?.length">
-                  <div
-                    v-for="(turn, i) in selectedChunk.dialogue_turns"
-                    :key="i"
-                    class="chat-turn"
-                    :class="turn.speaker"
-                  >
-                    <span class="chat-speaker">{{ turn.speaker === 'zundamon' ? 'ずんだもん' : 'めたん' }}</span>
-                    <div class="chat-bubble">{{ turn.text }}</div>
-                  </div>
-                </template>
-                <p v-else>{{ selectedChunk.dialogue_script || selectedChunk.summary_text || '(テキストなし)' }}</p>
-              </div>
-            </div>
-          </div>
-        </Transition>
       </footer>
     </Transition>
   </div>
@@ -983,29 +963,6 @@ async function generateChunkAudio(chunkId) {
   color: #90a4ae;
 }
 
-.ep-summary-wrap {
-  display: grid;
-  grid-template-rows: 0fr;
-  transition: grid-template-rows 0.28s ease;
-}
-
-.ep-summary-wrap.open {
-  grid-template-rows: 1fr;
-}
-
-.ep-summary {
-  overflow: hidden;
-  padding-top: 0;
-  transition: padding-top 0.28s ease;
-  font-size: 13px;
-  color: #546e7a;
-  line-height: 1.7;
-  white-space: pre-wrap;
-}
-
-.ep-summary-wrap.open .ep-summary {
-  padding-top: 10px;
-}
 
 .badge-audio {
   font-size: 18px;
@@ -1084,76 +1041,44 @@ async function generateChunkAudio(chunkId) {
   color: #90a4ae;
 }
 
-.transcript-toggle {
-  flex-shrink: 0;
-  width: 36px;
-  height: 36px;
-  border-radius: 50%;
-  background: rgba(67, 160, 71, 0.1);
-  color: #2e7d32;
-  font-size: 15px;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  transition: background 0.15s;
-  border: none;
-  cursor: pointer;
-}
-
-.transcript-toggle:hover {
-  background: rgba(67, 160, 71, 0.2);
-}
-
-.transcript-backdrop {
-  position: fixed;
-  inset: 0;
-  z-index: 500;
-  padding: 32px;
-  background: rgba(12, 24, 12, 0.62);
-  backdrop-filter: blur(10px);
-  display: flex;
-  align-items: stretch;
-  justify-content: center;
-}
-
-.transcript-panel {
-  width: min(1100px, 100%);
+/* ── Chunk detail (inline summary + conversation) ── */
+.chunk-detail {
+  margin-top: 28px;
   display: flex;
   flex-direction: column;
-  overflow: hidden;
-  border-radius: 22px;
-  background: #fff;
-  box-shadow: 0 24px 80px rgba(0, 30, 0, 0.28);
+  gap: 32px;
 }
 
-.transcript-header {
+.chunk-section {
   display: flex;
-  align-items: flex-start;
-  justify-content: space-between;
-  gap: 20px;
-  padding: 22px 28px;
-  border-bottom: 1px solid #f1f8e9;
+  flex-direction: column;
+  gap: 14px;
 }
 
-.transcript-header h2 {
+.chunk-section-label {
+  font-size: 11px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: #90a4ae;
   margin: 0;
-  color: #1b5e20;
-  font-size: 20px;
-  line-height: 1.35;
 }
 
-.transcript {
-  flex: 1;
-  overflow-y: auto;
-  padding: 28px 40px 40px;
-}
-
-.transcript p {
+.chunk-summary-text {
   margin: 0;
   font-size: 15px;
-  line-height: 1.95;
-  color: #546e7a;
+  line-height: 1.9;
+  color: #37474f;
   white-space: pre-wrap;
+}
+
+.conversation {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+  background: #1a1a2e;
+  border-radius: 16px;
+  padding: 24px 28px;
 }
 
 /* ── Chat transcript ── */
@@ -1180,31 +1105,32 @@ async function generateChunkAudio(chunkId) {
 }
 
 .chat-turn.zundamon .chat-speaker {
-  color: #2e7d32;
+  color: #81c784;
 }
 
 .chat-turn.metan .chat-speaker {
-  color: #6a1b9a;
+  color: #ce93d8;
 }
 
 .chat-bubble {
-  max-width: min(880px, 92%);
+  max-width: min(600px, 72%);
   padding: 12px 16px;
   border-radius: 16px;
   font-size: 14px;
   line-height: 1.85;
   white-space: pre-wrap;
+  word-break: break-word;
 }
 
 .chat-turn.zundamon .chat-bubble {
-  background: #e8f5e9;
-  color: #1b5e20;
+  background: #2e7d32;
+  color: #e8f5e9;
   border-bottom-left-radius: 4px;
 }
 
 .chat-turn.metan .chat-bubble {
-  background: #f3e5f5;
-  color: #4a148c;
+  background: #6a1b9a;
+  color: #f3e5f5;
   border-bottom-right-radius: 4px;
 }
 
